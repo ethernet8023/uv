@@ -10276,6 +10276,30 @@ enum LockErrorKind {
     VariantsJsonNonRegistry { name: PackageName },
     #[error("Package `{name}` has variant metadata without a SHA-256 hash", name = name.cyan())]
     VariantsJsonMissingHash { name: PackageName },
+    #[error(
+        "Cannot safely select a wheel variant for `{package_id}` because its reachability depends on unresolved conflicting extras"
+    )]
+    VariantConflictReachability { package_id: PackageId },
+    #[error("Package `{package_id}` requires wheel variant selection")]
+    VariantSelectionRequired { package_id: PackageId },
+    #[error("Failed to fetch wheel variant metadata for `{package_id}`")]
+    VariantsJsonFetch {
+        package_id: PackageId,
+        #[source]
+        error: uv_client::Error,
+    },
+    #[error("Failed to parse wheel variant metadata for `{package_id}`")]
+    VariantsJsonParse {
+        package_id: PackageId,
+        #[source]
+        error: uv_distribution_types::VariantsJsonParseError,
+    },
+    #[error("Failed to select a wheel variant for `{package_id}`")]
+    VariantSelection {
+        package_id: PackageId,
+        #[source]
+        error: uv_distribution::Error,
+    },
     /// An error that occurs when an ambiguous `package.dependency` is
     /// missing a `source` field.
     #[error("Dependency `{name}` has missing `source` field but has more than one matching package", name = name.cyan())]

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
@@ -9,14 +10,24 @@ use itertools::Itertools;
 use petgraph::Graph;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use uv_cache::Cache;
+use uv_client::RegistryClient;
 use uv_configuration::{
     BuildOptions, DependencyGroupsWithDefaults, ExtrasSpecification,
     ExtrasSpecificationWithDefaults, InstallOptions,
 };
-use uv_distribution_types::{Edge, FirstParty, Node, Resolution, ResolvedDist};
+use uv_distribution::{DistributionDatabase, read_locked_wheel_variant};
+use uv_distribution_types::{
+    BuiltDist, Dist, Edge, FirstParty, Node, Resolution, ResolvedDist, SelectedVariant,
+    VariantsJsonContent,
+};
 use uv_normalize::{DefaultExtras, ExtraName, GroupName, PackageName};
+use uv_pep508::{
+    MarkerTree, MarkerVariantsEnvironment, VariantFeature, VariantNamespace, VariantValue,
+};
 use uv_platform_tags::Tags;
-use uv_pypi_types::{ConflictKind, ConflictSet, ResolverMarkerEnvironment};
+use uv_pypi_types::{ConflictItem, ConflictKind, ConflictSet, ResolverMarkerEnvironment};
+use uv_types::BuildContext;
 
 use uv_resolver_types::UniversalMarker;
 use uv_resolver_types::universal_marker::ActivatedConflictItems;
@@ -166,6 +177,129 @@ pub trait Installable<'lock> {
         )
     }
 
+    /// Return the selected variant properties for a package's dependency markers.
+    fn variant_environment(&self, _package: &Package) -> impl MarkerVariantsEnvironment {
+        None::<SelectedVariant>
+    }
+
+    /// Return whether a package's artifact has been selected.
+    fn dependencies_ready(&self, _package: &Package) -> bool {
+        true
+    }
+
+    /// Request artifact selection for a package reached by the final graph traversal.
+    fn request_selection(&self, _package: &Package, _stable: bool) {}
+
+    /// Return whether this traversal authenticates and selects wheel variants.
+    fn selects_variants(&self) -> bool {
+        false
+    }
+
+    /// Return whether this lock contains a wheel variant.
+    fn has_variants(&self) -> bool {
+        self.lock().packages().iter().any(package_has_variants)
+    }
+
+    /// Select each reachable package's artifact before following its dependencies.
+    #[expect(async_fn_in_trait)]
+    async fn to_resolution_with_variants<Context: BuildContext>(
+        &self,
+        marker_env: &ResolverMarkerEnvironment,
+        tags: &Tags,
+        extras: &ExtrasSpecificationWithDefaults,
+        groups: &DependencyGroupsWithDefaults,
+        build_options: &BuildOptions,
+        install_options: &InstallOptions,
+        client: &RegistryClient,
+        database: &DistributionDatabase<'_, Context>,
+        cache: &Cache,
+        require_provider_hashes: bool,
+    ) -> Result<Resolution, LockError> {
+        let mut target = VariantInstallable {
+            target: self,
+            selected: FxHashMap::default(),
+            variants: FxHashMap::default(),
+            requested: RefCell::new(FxHashMap::default()),
+            pending: RefCell::new(FxHashMap::default()),
+        };
+        loop {
+            let resolution = target.to_resolution(
+                marker_env,
+                tags,
+                extras,
+                groups,
+                build_options,
+                install_options,
+            )?;
+            let pending = target.pending.take();
+            if pending.is_empty() {
+                let contexts = target.selected.iter().filter_map(|(index, node)| {
+                    let Node::Dist {
+                        dist: ResolvedDist::Installable { dist, .. },
+                        ..
+                    } = node
+                    else {
+                        return None;
+                    };
+                    let Dist::Built(built) = dist.as_ref() else {
+                        return None;
+                    };
+                    let filename = built.wheel_filename();
+                    let variant = target
+                        .variants
+                        .get(&variant_base(self.lock().package(*index)))?;
+                    Some((filename.clone(), variant.clone()))
+                });
+                return Ok(resolution.with_variant_contexts(contexts));
+            }
+            if !pending.values().any(|(_, stable)| *stable) {
+                let index = pending.keys().min_by_key(|index| index.0).copied();
+                if let Some(index) = index {
+                    return Err(LockErrorKind::VariantConflictReachability {
+                        package_id: self.lock().package(index).id.clone(),
+                    }
+                    .into());
+                }
+            }
+            for (index, (install, stable)) in pending {
+                if !stable {
+                    continue;
+                }
+                let package = self.lock().package(index);
+                let to_node = |package: &Package| {
+                    if install {
+                        self.installable_node(package, tags, marker_env, build_options)
+                    } else {
+                        self.non_installable_node(package, tags, marker_env)
+                    }
+                };
+                let node = to_node(package)?;
+                let selected = select_variant(
+                    package,
+                    node,
+                    self.install_path(),
+                    tags,
+                    client,
+                    database,
+                    cache,
+                    require_provider_hashes,
+                )
+                .await?;
+                let (node, variant) = if let Some(selected) = selected {
+                    selected
+                } else {
+                    let mut source_package = package.clone();
+                    source_package.wheels.clear();
+                    (to_node(&source_package)?, None)
+                };
+                if let Some(variant) = variant {
+                    target.variants.insert(variant_base(package), variant);
+                }
+                target.selected.insert(index, node);
+            }
+        }
+    }
+
     /// Create an installable [`Node`] from a [`Package`].
     fn installable_node(
         &self,
@@ -234,6 +368,12 @@ pub trait Installable<'lock> {
         install_options: &InstallOptions,
         marker_env: &ResolverMarkerEnvironment,
     ) -> Result<Node, LockError> {
+        if package_has_variants(package) && !self.selects_variants() {
+            return Err(LockErrorKind::VariantSelectionRequired {
+                package_id: package.id.clone(),
+            }
+            .into());
+        }
         if install_options.include_package(
             package.as_install_target(),
             self.project_name(),
@@ -276,6 +416,18 @@ trait InstallableExt<'lock>: Installable<'lock> {
         let mut activated_extras: Vec<(&PackageName, &ExtraName)> = vec![];
         let mut activated_groups: Vec<(&PackageName, &GroupName)> = vec![];
         let has_conflicts = !self.lock().conflicts().is_empty();
+        let track_variant_conflicts = has_conflicts && self.selects_variants();
+        // A variant expression belongs to the package declaring the dependency. Evaluate it before
+        // propagating the remaining conflict condition to the dependency's package.
+        let variant_conflict = |marker: UniversalMarker, package: &Package| {
+            UniversalMarker::new(
+                MarkerTree::TRUE,
+                marker.conflict_for_environment_with_variants(
+                    marker_env,
+                    &self.variant_environment(package),
+                ),
+            )
+        };
         let validate_conflicts = !include_manifest && has_conflicts;
         let mut dependencies_for_conflict_validation = vec![];
 
@@ -363,6 +515,15 @@ trait InstallableExt<'lock>: Installable<'lock> {
 
         // Add the workspace dependencies to the queue.
         for (dist, package_index, index, root_kind) in initialized_roots {
+            if !self.dependencies_ready(dist) {
+                queue.push_back((package_index, None));
+                add_reachability(
+                    &mut conflict_reachability,
+                    (package_index, None),
+                    UniversalMarker::TRUE,
+                );
+                continue;
+            }
             if root_kind == InstallableRootKind::Production && groups.prod() {
                 // Push its dependencies onto the queue.
                 queue.push_back((package_index, None));
@@ -398,8 +559,9 @@ trait InstallableExt<'lock>: Installable<'lock> {
                     dependencies_for_conflict_validation.push((dist, dep));
                 }
                 let additional_activated_extras = newly_activated_extras(dep, &activated_extras);
-                if !dep.complexified_marker.evaluate(
+                if !dep.complexified_marker.evaluate_with_variants(
                     marker_env,
+                    &self.variant_environment(dist),
                     activated_projects.iter().copied(),
                     activated_extras
                         .iter()
@@ -462,10 +624,15 @@ trait InstallableExt<'lock>: Installable<'lock> {
                 }
 
                 // Push its dependencies on the queue.
+                let dependency_reachability = if track_variant_conflicts {
+                    variant_conflict(dep.complexified_marker, dist)
+                } else {
+                    dep.complexified_marker
+                };
                 add_reachability(
                     &mut conflict_reachability,
                     (dep.index, None),
-                    dep.complexified_marker,
+                    dependency_reachability,
                 );
                 if seen.insert((dep.index, None)) {
                     queue.push_back((dep.index, None));
@@ -474,7 +641,7 @@ trait InstallableExt<'lock>: Installable<'lock> {
                     add_reachability(
                         &mut conflict_reachability,
                         (dep.index, Some(extra)),
-                        dep.complexified_marker,
+                        dependency_reachability,
                     );
                     if seen.insert((dep.index, Some(extra))) {
                         queue.push_back((dep.index, Some(extra)));
@@ -677,20 +844,32 @@ trait InstallableExt<'lock>: Installable<'lock> {
             let mut activated_extras_set: BTreeSet<(&PackageName, &ExtraName)> =
                 activated_extras.iter().copied().collect();
             let mut queue = queue.clone();
-            let mut reachability = conflict_reachability;
+            let mut reachability = if track_variant_conflicts {
+                conflict_reachability.clone()
+            } else {
+                std::mem::take(&mut conflict_reachability)
+            };
             while let Some((package_index, extra)) = queue.pop_front() {
                 let package = self.lock().package(package_index);
+                if !self.dependencies_ready(package) {
+                    continue;
+                }
                 let Some(parent_reachability) = reachability.get(&(package_index, extra)).copied()
                 else {
                     continue;
                 };
                 for dep in package_dependencies(package, extra) {
-                    let mut dep_reachability = dep.complexified_marker;
+                    let mut dep_reachability = if track_variant_conflicts {
+                        variant_conflict(dep.complexified_marker, package)
+                    } else {
+                        dep.complexified_marker
+                    };
                     dep_reachability.and(parent_reachability);
                     let additional_activated_extras =
                         newly_activated_extras(dep, &activated_extras);
-                    if !dep_reachability.evaluate(
+                    if !dep_reachability.evaluate_with_variants(
                         marker_env,
+                        &self.variant_environment(package),
                         activated_projects.iter().copied(),
                         activated_extras
                             .iter()
@@ -763,16 +942,39 @@ trait InstallableExt<'lock>: Installable<'lock> {
             activated_groups.iter().copied(),
         );
 
+        let mut unresolved = FxHashSet::default();
         while let Some((package_index, extra)) = queue.pop_front() {
             let package = self.lock().package(package_index);
+            if !self.dependencies_ready(package) {
+                unresolved.insert((package_index, extra));
+                continue;
+            }
+            let reachability = if track_variant_conflicts {
+                conflict_reachability
+                    .get(&(package_index, extra))
+                    .copied()
+                    .unwrap_or(UniversalMarker::TRUE)
+            } else {
+                UniversalMarker::TRUE
+            };
+            if track_variant_conflicts
+                && !reachability.evaluate_activated_with_variants(
+                    marker_env,
+                    &self.variant_environment(package),
+                    &activated,
+                )
+            {
+                continue;
+            }
             for dep in package_dependencies(package, extra) {
                 if validate_conflicts && dep.complexified_marker.has_conflict_marker() {
                     dependencies_for_conflict_validation.push((package, dep));
                 }
-                if !dep
-                    .complexified_marker
-                    .evaluate_activated(marker_env, &activated)
-                {
+                if !dep.complexified_marker.evaluate_activated_with_variants(
+                    marker_env,
+                    &self.variant_environment(package),
+                    &activated,
+                ) {
                     continue;
                 }
 
@@ -818,14 +1020,103 @@ trait InstallableExt<'lock>: Installable<'lock> {
                 );
 
                 // Push its dependencies on the queue.
+                let dependency_reachability = track_variant_conflicts.then(|| {
+                    let mut dependency_reachability = reachability;
+                    dependency_reachability.and(variant_conflict(dep.complexified_marker, package));
+                    dependency_reachability
+                });
+                if let Some(dependency_reachability) = dependency_reachability {
+                    add_reachability(
+                        &mut conflict_reachability,
+                        (dep.index, None),
+                        dependency_reachability,
+                    );
+                }
                 if seen.insert((dep.index, None)) {
                     queue.push_back((dep.index, None));
                 }
                 for extra in &dep.extra {
+                    if let Some(dependency_reachability) = dependency_reachability {
+                        add_reachability(
+                            &mut conflict_reachability,
+                            (dep.index, Some(extra)),
+                            dependency_reachability,
+                        );
+                    }
                     if seen.insert((dep.index, Some(extra))) {
                         queue.push_back((dep.index, Some(extra)));
                     }
                 }
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let potentially_activated_extras = if has_conflicts {
+                self.lock()
+                    .packages()
+                    .iter()
+                    .flat_map(Package::all_dependencies)
+                    .flat_map(|dependency| {
+                        dependency
+                            .extra
+                            .iter()
+                            .map(|extra| (&dependency.package_id.name, extra))
+                    })
+                    .collect::<FxHashSet<_>>()
+            } else {
+                FxHashSet::default()
+            };
+            // Selection can reveal additional extras. Run providers only for packages that stay
+            // reachable regardless of extras that unresolved packages might activate.
+            for (package_index, extra) in unresolved {
+                let package = self.lock().package(package_index);
+                let reachability = if track_variant_conflicts {
+                    conflict_reachability[&(package_index, extra)]
+                } else {
+                    UniversalMarker::TRUE
+                };
+                if track_variant_conflicts
+                    && !reachability.evaluate_activated_with_variants(
+                        marker_env,
+                        &self.variant_environment(package),
+                        &activated,
+                    )
+                {
+                    continue;
+                }
+                let stable = if has_conflicts {
+                    let mut stable_reachability = reachability;
+                    for set in self.lock().conflicts().iter() {
+                        let is_active = |item: &ConflictItem| match item.kind() {
+                            ConflictKind::Project => activated_projects.contains(&item.package()),
+                            ConflictKind::Extra(extra) => {
+                                activated_extras.contains(&(item.package(), extra))
+                            }
+                            ConflictKind::Group(group) => {
+                                activated_groups.contains(&(item.package(), group))
+                            }
+                        };
+                        let set_active = set.iter().any(is_active);
+                        for item in set.iter() {
+                            if is_active(item) {
+                                stable_reachability.assume_conflict_item(item);
+                            } else {
+                                let fixed_inactive = match item.kind() {
+                                    ConflictKind::Project | ConflictKind::Group(_) => true,
+                                    ConflictKind::Extra(extra) => !potentially_activated_extras
+                                        .contains(&(item.package(), extra)),
+                                };
+                                if set_active || fixed_inactive {
+                                    stable_reachability.assume_not_conflict_item(item);
+                                }
+                            }
+                        }
+                    }
+                    stable_reachability.conflict().is_true()
+                } else {
+                    true
+                };
+                self.request_selection(package, stable);
             }
         }
 
@@ -1032,6 +1323,345 @@ impl Lock {
             install_options,
         )
     }
+}
+
+fn package_has_variants(package: &Package) -> bool {
+    package.variants_json.is_some()
+        || package
+            .wheels
+            .iter()
+            .any(|wheel| wheel.filename.variant().is_some())
+}
+
+fn variant_base(package: &Package) -> String {
+    format!(
+        "{}=={}",
+        package.name(),
+        package
+            .version()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    )
+}
+
+struct VariantInstallable<'a, T: ?Sized> {
+    target: &'a T,
+    selected: FxHashMap<PackageIndex, Node>,
+    variants: FxHashMap<String, SelectedVariant>,
+    requested: RefCell<FxHashMap<PackageIndex, bool>>,
+    pending: RefCell<FxHashMap<PackageIndex, (bool, bool)>>,
+}
+
+impl<'lock, T: Installable<'lock> + ?Sized> VariantInstallable<'_, T> {
+    fn selected_node(&self, package: &Package, install: bool) -> Node {
+        let index = self.lock().by_id[&package.id];
+        if let Some(Node::Dist {
+            dist,
+            hashes,
+            install: selected_install,
+        }) = self.selected.get(&index)
+            && (!install || *selected_install)
+        {
+            return Node::Dist {
+                dist: dist.clone(),
+                hashes: hashes.clone(),
+                install,
+            };
+        }
+        self.requested
+            .borrow_mut()
+            .entry(index)
+            .and_modify(|requested_install| *requested_install |= install)
+            .or_insert(install);
+        Node::Root
+    }
+}
+
+impl<'lock, T: Installable<'lock> + ?Sized> Installable<'lock> for VariantInstallable<'_, T> {
+    fn install_path(&self) -> &'lock Path {
+        self.target.install_path()
+    }
+
+    fn lock(&self) -> &'lock Lock {
+        self.target.lock()
+    }
+
+    fn roots(&self) -> impl Iterator<Item = &PackageName> {
+        self.target.roots()
+    }
+
+    fn group_root(&self, groups: &DependencyGroupsWithDefaults) -> Option<&PackageName> {
+        self.target.group_root(groups)
+    }
+
+    fn includes_group(
+        &self,
+        package: Option<&PackageName>,
+        group: &GroupName,
+        groups: &DependencyGroupsWithDefaults,
+    ) -> bool {
+        self.target.includes_group(package, group, groups)
+    }
+
+    fn project_name(&self) -> Option<&PackageName> {
+        self.target.project_name()
+    }
+
+    fn installable_node(
+        &self,
+        package: &Package,
+        tags: &Tags,
+        marker_env: &ResolverMarkerEnvironment,
+        build_options: &BuildOptions,
+    ) -> Result<Node, LockError> {
+        if package_has_variants(package) {
+            Ok(self.selected_node(package, true))
+        } else {
+            self.target
+                .installable_node(package, tags, marker_env, build_options)
+        }
+    }
+
+    fn non_installable_node(
+        &self,
+        package: &Package,
+        tags: &Tags,
+        marker_env: &ResolverMarkerEnvironment,
+    ) -> Result<Node, LockError> {
+        if package_has_variants(package) {
+            Ok(self.selected_node(package, false))
+        } else {
+            self.target.non_installable_node(package, tags, marker_env)
+        }
+    }
+
+    fn dependencies_ready(&self, package: &Package) -> bool {
+        if !package_has_variants(package) {
+            return true;
+        }
+        let index = self.lock().by_id[&package.id];
+        match self.selected.get(&index) {
+            Some(Node::Dist { install, .. }) => {
+                *install
+                    || !self
+                        .requested
+                        .borrow()
+                        .get(&index)
+                        .copied()
+                        .unwrap_or(false)
+            }
+            Some(Node::Root) | None => false,
+        }
+    }
+
+    fn request_selection(&self, package: &Package, stable: bool) {
+        let index = self.lock().by_id[&package.id];
+        if let Some(install) = self.requested.borrow().get(&index).copied() {
+            self.pending
+                .borrow_mut()
+                .entry(index)
+                .and_modify(|(pending_install, pending_stable)| {
+                    *pending_install |= install;
+                    *pending_stable |= stable;
+                })
+                .or_insert((install, stable));
+        }
+    }
+
+    fn selects_variants(&self) -> bool {
+        true
+    }
+
+    fn variant_environment(&self, package: &Package) -> impl MarkerVariantsEnvironment {
+        CurrentVariant {
+            current: self.variants.get(&variant_base(package)),
+            all: &self.variants,
+        }
+    }
+}
+
+struct CurrentVariant<'a> {
+    current: Option<&'a SelectedVariant>,
+    all: &'a FxHashMap<String, SelectedVariant>,
+}
+
+impl MarkerVariantsEnvironment for CurrentVariant<'_> {
+    fn contains_namespace(&self, namespace: &VariantNamespace) -> bool {
+        self.current
+            .is_some_and(|variant| variant.contains_namespace(namespace))
+    }
+
+    fn contains_feature(&self, namespace: &VariantNamespace, feature: &VariantFeature) -> bool {
+        self.current
+            .is_some_and(|variant| variant.contains_feature(namespace, feature))
+    }
+
+    fn contains_property(
+        &self,
+        namespace: &VariantNamespace,
+        feature: &VariantFeature,
+        value: &VariantValue,
+    ) -> bool {
+        self.current
+            .is_some_and(|variant| variant.contains_property(namespace, feature, value))
+    }
+
+    fn contains_base_namespace(&self, base: &str, namespace: &VariantNamespace) -> bool {
+        self.all
+            .get(base)
+            .is_some_and(|variant| variant.contains_namespace(namespace))
+    }
+
+    fn contains_base_feature(
+        &self,
+        base: &str,
+        namespace: &VariantNamespace,
+        feature: &VariantFeature,
+    ) -> bool {
+        self.all
+            .get(base)
+            .is_some_and(|variant| variant.contains_feature(namespace, feature))
+    }
+
+    fn contains_base_property(
+        &self,
+        base: &str,
+        namespace: &VariantNamespace,
+        feature: &VariantFeature,
+        value: &VariantValue,
+    ) -> bool {
+        self.all
+            .get(base)
+            .is_some_and(|variant| variant.contains_property(namespace, feature, value))
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.current.and_then(MarkerVariantsEnvironment::label)
+    }
+
+    fn base_label(&self, base: &str) -> Option<&str> {
+        self.all
+            .get(base)
+            .and_then(MarkerVariantsEnvironment::label)
+    }
+}
+
+async fn select_variant<Context: BuildContext>(
+    package: &Package,
+    mut node: Node,
+    install_path: &Path,
+    tags: &Tags,
+    client: &RegistryClient,
+    database: &DistributionDatabase<'_, Context>,
+    cache: &Cache,
+    require_provider_hashes: bool,
+) -> Result<Option<(Node, Option<SelectedVariant>)>, LockError> {
+    let Node::Dist {
+        dist: ResolvedDist::Installable { dist, .. },
+        hashes,
+        ..
+    } = &mut node
+    else {
+        return Ok(Some((node, None)));
+    };
+    let Dist::Built(built) = Arc::make_mut(dist) else {
+        return Ok(Some((node, None)));
+    };
+    let variant = match built {
+        BuiltDist::Registry(registry) => {
+            let has_candidate = registry.wheels.iter().any(|wheel| {
+                wheel.filename.variant().is_some()
+                    && wheel.filename.compatibility(tags).is_compatible()
+            });
+            if !has_candidate {
+                let ordinary = registry.best_wheel().filename.variant().is_none();
+                return Ok(ordinary.then_some((node, None)));
+            }
+            let Some(sidecar) = package.to_registry_variants_json(install_path)? else {
+                let ordinary = registry.best_wheel().filename.variant().is_none();
+                return Ok(ordinary.then_some((node, None)));
+            };
+            let fetched = client
+                .fetch_variants_json(package.name(), &sidecar.file, &sidecar.index)
+                .await
+                .map_err(|error| LockErrorKind::VariantsJsonFetch {
+                    package_id: package.id.clone(),
+                    error,
+                })?;
+            let metadata = VariantsJsonContent::from_slice(&fetched.contents).map_err(|error| {
+                LockErrorKind::VariantsJsonParse {
+                    package_id: package.id.clone(),
+                    error,
+                }
+            })?;
+            let supported = database
+                .supported_variant_properties(&metadata, require_provider_hashes)
+                .await
+                .map_err(|error| LockErrorKind::VariantSelection {
+                    package_id: package.id.clone(),
+                    error,
+                })?;
+            let selected = registry
+                .wheels
+                .iter()
+                .enumerate()
+                .filter(|(_, wheel)| wheel.index == sidecar.index)
+                .filter_map(|(index, wheel)| {
+                    let compatibility = wheel.filename.compatibility(tags);
+                    if !compatibility.is_compatible() {
+                        return None;
+                    }
+                    let label = wheel.filename.variant()?;
+                    let score = metadata.score_variant(label, &supported)?;
+                    Some((
+                        (score, compatibility, wheel.filename.build_tag()),
+                        index,
+                        label,
+                    ))
+                })
+                .max_by(|(left, ..), (right, ..)| left.cmp(right));
+            let Some((_, index, label)) = selected else {
+                let ordinary = registry.best_wheel().filename.variant().is_none();
+                return Ok(ordinary.then_some((node, None)));
+            };
+            let variant = metadata.select_variant(label, &supported);
+            registry.best_wheel_index = index;
+            *hashes = registry.best_wheel().file.hashes.clone();
+            variant
+        }
+        BuiltDist::DirectUrl(_) | BuiltDist::Path(_) | BuiltDist::GitPath(_) => {
+            let Some(label) = built.wheel_filename().variant() else {
+                return Ok(Some((node, None)));
+            };
+            let expected_size = package
+                .wheels
+                .iter()
+                .find(|wheel| &wheel.filename == built.wheel_filename())
+                .and_then(|wheel| wheel.size);
+            let metadata =
+                read_locked_wheel_variant(client, cache, built, hashes.as_slice(), expected_size)
+                    .await
+                    .map_err(|error| LockErrorKind::VariantSelection {
+                        package_id: package.id.clone(),
+                        error,
+                    })?;
+            let Some(metadata) = metadata else {
+                return Ok(None);
+            };
+            let supported = database
+                .supported_variant_properties(&metadata, require_provider_hashes)
+                .await
+                .map_err(|error| LockErrorKind::VariantSelection {
+                    package_id: package.id.clone(),
+                    error,
+                })?;
+            let Some(variant) = metadata.select_variant(label, &supported) else {
+                return Ok(None);
+            };
+            Some(variant)
+        }
+    };
+    Ok(Some((node, variant)))
 }
 
 #[cfg(test)]
