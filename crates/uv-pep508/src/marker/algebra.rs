@@ -850,6 +850,41 @@ impl InternerGuard<'_> {
         result
     }
 
+    /// Scope wheel variant expressions to the package whose dependencies contain them.
+    pub(crate) fn scope_variants(&mut self, marker: NodeId, base: &str) -> NodeId {
+        self.scope_variants_cached(marker, base, &mut FxHashMap::default())
+    }
+
+    fn scope_variants_cached(
+        &mut self,
+        marker: NodeId,
+        base: &str,
+        cache: &mut FxHashMap<NodeId, NodeId>,
+    ) -> NodeId {
+        if marker.is_true() || marker.is_false() {
+            return marker;
+        }
+        if let Some(&result) = cache.get(&marker) {
+            return result;
+        }
+
+        let node = self.shared.node(marker);
+        let mut changed = false;
+        let children = node.children.map(marker, |child| {
+            let scoped = self.scope_variants_cached(child, base, cache);
+            changed |= scoped != child;
+            scoped
+        });
+        let variable = node.var.with_variant_base(base);
+        let result = if variable.is_none() && !changed {
+            marker
+        } else {
+            self.rebuild_node(variable.as_ref().unwrap_or(&node.var), children)
+        };
+        cache.insert(marker, result);
+        result
+    }
+
     /// Substitute activation intervals without enumerating DNF paths.
     pub(crate) fn resolve_extras_with_bounds(
         &mut self,
@@ -1412,6 +1447,35 @@ pub(crate) enum Variable {
 }
 
 impl Variable {
+    fn with_variant_base(&self, base: &str) -> Option<Self> {
+        match self {
+            Self::String(CanonicalMarkerValueString::VariantLabel) => Some(Self::String(
+                CanonicalMarkerValueString::VariantLabelBase(base.into()),
+            )),
+            Self::In {
+                key: CanonicalMarkerValueString::VariantLabel,
+                value,
+            } => Some(Self::In {
+                key: CanonicalMarkerValueString::VariantLabelBase(base.into()),
+                value: value.clone(),
+            }),
+            Self::Contains {
+                key: CanonicalMarkerValueString::VariantLabel,
+                value,
+            } => Some(Self::Contains {
+                key: CanonicalMarkerValueString::VariantLabelBase(base.into()),
+                value: value.clone(),
+            }),
+            Self::List(pair) => pair.with_variant_base(base).map(Self::List),
+            Self::String(_)
+            | Self::VersionString(_)
+            | Self::Version(_)
+            | Self::In { .. }
+            | Self::Contains { .. }
+            | Self::Extra(_) => None,
+        }
+    }
+
     /// Returns `true` if the variable is known to be involved in _at least_ one conflicting
     /// marker pair.
     ///

@@ -237,6 +237,21 @@ pub enum CanonicalMarkerListPair {
 }
 
 impl CanonicalMarkerListPair {
+    pub(crate) fn with_variant_base(&self, base: &str) -> Option<Self> {
+        let mut scoped = self.clone();
+        let slot = match &mut scoped {
+            Self::VariantNamespaces { base, .. }
+            | Self::VariantFeatures { base, .. }
+            | Self::VariantProperties { base, .. } => base,
+            Self::Extras(_) | Self::DependencyGroup(_) | Self::Arbitrary { .. } => return None,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(base.to_owned());
+        Some(scoped)
+    }
+
     /// Whether this pair represents a possible variant set member.
     pub(crate) fn is_variant(&self) -> bool {
         match self {

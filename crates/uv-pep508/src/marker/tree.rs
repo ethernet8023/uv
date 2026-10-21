@@ -1882,6 +1882,15 @@ impl MarkerTree {
         imp(self, &mut f, &mut None);
     }
 
+    /// Scope variant expressions to the package whose selected wheel determines their values.
+    #[must_use]
+    pub fn with_variant_base(self, base: &str) -> Self {
+        if !self.has_variant_expression() {
+            return self;
+        }
+        Self(INTERNER.lock().scope_variants(self.0, base))
+    }
+
     fn simplify_extras_with_impl(self, is_extra: &impl Fn(&ExtraName) -> bool) -> Self {
         Self(INTERNER.lock().restrict_by(self.0, &|var| match var {
             Variable::Extra(name) => is_extra(name.extra()).then_some(true),
@@ -2374,6 +2383,17 @@ mod test {
                 &[]
             )
         );
+    }
+
+    #[test]
+    fn pep825_package_scopes() {
+        let parent = m("variant_label == 'null'").with_variant_base("parent==1");
+        let child = m("variant_label == '' and 'nvidia::sm_arch' in variant_features");
+        let scoped = parent.and(child).with_variant_base("child==1");
+        assert!(!scoped.is_false());
+        assert_eq!(scoped, parent.and(child.with_variant_base("child==1")));
+        assert_eq!(scoped, scoped.with_variant_base("successor==1"));
+        assert_eq!(scoped, m(&scoped.try_to_string().expect("scoped marker")));
     }
 
     /// Every Boolean function of three extras must roundtrip to the same diagram. The cover
