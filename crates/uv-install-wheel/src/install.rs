@@ -50,7 +50,11 @@ fn wheel_destination<'layout>(
 ///
 /// Wheel 1.0: <https://www.python.org/dev/peps/pep-0427/>
 #[instrument(skip_all, fields(wheel = %filename))]
-pub fn install_wheel<Cache: serde::Serialize, Build: serde::Serialize, Variant: serde::Serialize>(
+pub fn install_wheel<
+    Cache: serde::Serialize,
+    Build: serde::Serialize,
+    Variant: serde::Serialize,
+>(
     layout: &Layout,
     relocatable: bool,
     wheel: impl AsRef<Path>,

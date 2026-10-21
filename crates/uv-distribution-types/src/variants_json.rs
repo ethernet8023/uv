@@ -10,9 +10,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
+use uv_normalize::PackageName;
 use uv_pep508::MarkerVariantsEnvironment;
 pub use uv_pep508::{VariantFeature, VariantNamespace, VariantValue};
-use uv_normalize::PackageName;
+
+use crate::IndexUrl;
 
 // TODO(konsti): Standardize on a single schema URL once the variant metadata format is finalized.
 /// The PEP 825 draft schema for variant metadata without providers.
@@ -122,6 +124,7 @@ impl fmt::Display for UnsupportedVariantProperties {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SupportedVariantProperties {
+    #[serde(deserialize_with = "deserialize_unique_map")]
     properties: BTreeMap<VariantNamespace, Vec<(VariantFeature, Vec<VariantValue>)>>,
 }
 
@@ -170,12 +173,14 @@ impl SupportedVariantProperties {
 pub struct VariantPolicy {
     target: Option<SupportedVariantProperties>,
     enabled: BTreeMap<VariantNamespace, VariantProviderOptIn>,
+    provider_index: Option<IndexUrl>,
 }
 
 impl VariantPolicy {
     pub fn new(
         target: Option<SupportedVariantProperties>,
         enabled: impl IntoIterator<Item = VariantProviderOptIn>,
+        provider_index: Option<IndexUrl>,
     ) -> Self {
         Self {
             target,
@@ -183,6 +188,7 @@ impl VariantPolicy {
                 .into_iter()
                 .map(|opt_in| (opt_in.namespace.clone(), opt_in))
                 .collect(),
+            provider_index,
         }
     }
 
@@ -198,6 +204,11 @@ impl VariantPolicy {
 
     pub fn opt_in(&self, namespace: &VariantNamespace) -> Option<&VariantProviderOptIn> {
         self.enabled.get(namespace)
+    }
+
+    /// The user-authorized index for external provider packages and their dependencies.
+    pub fn provider_index(&self) -> Option<&IndexUrl> {
+        self.provider_index.as_ref()
     }
 
     /// Suppress host detection for a foreign target without explicit properties.

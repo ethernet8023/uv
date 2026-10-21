@@ -9,15 +9,18 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::debug;
 
-use uv_configuration::{BuildOptions, NoBinary, NoBuild};
+use uv_configuration::{
+    BuildOptions, Constraints, HashCheckingMode, IndexStrategy, NoBinary, NoBuild, NoSources,
+};
 use uv_distribution_types::{
-    Dist, PluginVariantFeature, Requirement, ResolvedDist, VariantProviderOptIn,
-    valid_plugin_endpoint,
+    BuiltDist, DependencyMetadata, Dist, Index, IndexLocations, IndexUrl, PluginVariantFeature,
+    Requirement, ResolvedDist, VariantProviderOptIn, valid_plugin_endpoint,
 };
 use uv_pep508::{Requirement as Pep508Requirement, VersionOrUrl};
 use uv_pypi_types::VerbatimParsedUrl;
+use uv_resolver::{ExcludeNewer, FlatIndex};
 use uv_static::EnvVars;
-use uv_types::{BuildContext, BuildStack, HashVerification};
+use uv_types::{BuildContext, BuildStack, HashStrategy, HashVerification};
 use uv_virtualenv::{OnExisting, Prompt, Seed, UpgradePolicy};
 
 use crate::BuildDispatch;
@@ -31,6 +34,7 @@ const MAX_OUTPUT_BYTES: u64 = 1_048_576;
 struct ProviderKey {
     requires: Vec<String>,
     endpoint: String,
+    index: IndexUrl,
 }
 
 #[derive(Clone, Default)]
@@ -56,6 +60,8 @@ pub(crate) async fn query(
                 requirement.len() <= MAX_REQUIREMENT_LENGTH,
                 "provider requirement is too long"
             );
+            // Index metadata controls this input. Bound both nested expressions and long chains
+            // of boolean operators before handing the marker to the recursive PEP 508 parser.
             if let Some((_, marker)) = requirement.split_once(';') {
                 let boolean_operators = marker
                     .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -100,10 +106,16 @@ pub(crate) async fn query(
     if !opt_in.authorizes(&packages, &endpoint) {
         return Ok(None);
     }
+    let index = dispatch
+        .variant_policy
+        .and_then(|policy| policy.provider_index())
+        .context("external wheel variant providers require an authorized provider index")?;
     let required_verification = match dispatch.base_hasher.verification() {
         HashVerification::Required(_) => true,
         HashVerification::None | HashVerification::IfPresent(_) => false,
     };
+    // The package wheel's hash does not authenticate the provider or its dependencies.
+    // TODO(konsti): Record provider wheel hashes so hash checking can cover this environment.
     ensure!(
         !require_hashes && !required_verification,
         "wheel variant provider packages cannot be installed when hashes are required; provide static target properties"
@@ -126,6 +138,7 @@ pub(crate) async fn query(
     let key = ProviderKey {
         requires: requires.to_vec(),
         endpoint: endpoint.clone(),
+        index: index.clone(),
     };
     let cell = dispatch
         .shared_state
@@ -137,7 +150,7 @@ pub(crate) async fn query(
         .or_default()
         .clone();
     let features = cell
-        .get_or_try_init(|| run(dispatch, &active, &endpoint))
+        .get_or_try_init(|| run(dispatch, &active, &endpoint, index))
         .await?;
     Ok(Some(features.clone()))
 }
@@ -146,9 +159,32 @@ async fn run(
     dispatch: &BuildDispatch<'_>,
     requirements: &[Requirement],
     endpoint: &str,
+    index: &IndexUrl,
 ) -> Result<Vec<PluginVariantFeature>> {
     let build_options = BuildOptions::new(NoBinary::None, NoBuild::All);
+    let index_locations =
+        IndexLocations::new(vec![Index::from_index_url(index.clone())], vec![], false);
+    let client = dispatch
+        .client
+        .clone()
+        .with_index_locations(index_locations.clone());
+    let constraints = Constraints::default();
+    let dependency_metadata = DependencyMetadata::default();
+    let flat_index = FlatIndex::default();
+    let hasher = HashStrategy::default();
+    // Provider code runs during resolution, so its packages must be selected independently of
+    // project-controlled sources, constraints, and dependency metadata.
     let provider_dispatch = BuildDispatch {
+        client: &client,
+        constraints: &constraints,
+        dependency_metadata: &dependency_metadata,
+        index_locations: &index_locations,
+        index_strategy: IndexStrategy::default(),
+        flat_index: &flat_index,
+        base_hasher: &hasher,
+        build_hash_checking: HashCheckingMode::Verify,
+        exclude_newer: ExcludeNewer::default(),
+        sources: NoSources::All,
         build_options: &build_options,
         variant_policy: None,
         shared_state: dispatch.shared_state.fork(),
@@ -160,16 +196,23 @@ async fn run(
         .await
         .context("failed to resolve provider requirements")?;
     for distribution in resolved.resolution().distributions() {
-        let ordinary_wheel = match distribution {
+        let authorized_wheel = match distribution {
             ResolvedDist::Installable { dist, .. } => match dist.as_ref() {
-                Dist::Built(built) => built.wheel_filename().variant().is_none(),
+                Dist::Built(BuiltDist::Registry(wheels)) => {
+                    let wheel = wheels.best_wheel();
+                    wheel.filename.variant().is_none() && &wheel.index == index
+                }
+                Dist::Built(
+                    BuiltDist::DirectUrl(_) | BuiltDist::Path(_) | BuiltDist::GitPath(_),
+                ) => false,
                 Dist::Source(_) => false,
             },
             ResolvedDist::Installed { .. } => false,
         };
         ensure!(
-            ordinary_wheel,
-            "provider dependency `{distribution}` is not a non-variant wheel"
+            authorized_wheel,
+            "provider dependency `{distribution}` is not a non-variant wheel from the \
+             authorized provider index"
         );
     }
 

@@ -49,6 +49,93 @@ fn gpu_variant() -> Value {
     })
 }
 
+/// Provider authorization must not let project-configured sources replace the trusted package.
+#[test]
+fn install_authorized_variant_provider_from_trusted_index() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "authorized-variant-provider"
+        root = {}
+        expected.satisfiable = true
+
+        [packages.ok.versions."1.0.0"]
+        wheel = false
+        sdist = false
+
+        [packages.ok.versions."1.0.0".variants]
+        namespaces = ["example"]
+
+        [packages.ok.versions."1.0.0".variants.providers.example]
+        requires = ["variant-provider>=1.0.0"]
+        plugin-api = "variant_provider.plugin:Provider"
+
+        [packages.ok.versions."1.0.0".variants.wheels]
+        accelerated.properties = ["example :: acceleration :: enabled"]
+    "#})?;
+    let server = PackseServer::from_scenario(&scenario);
+    let provider = indoc! {r#"
+        from types import SimpleNamespace
+
+        class Provider:
+            @classmethod
+            def get_supported_configs(cls):
+                return [SimpleNamespace(name="acceleration", values=["enabled"], multi_value=False)]
+    "#};
+    let (filename, wheel) = WheelBuilder::new(&"variant-provider".parse()?, &"1.0.0".parse()?)
+        .files(&[("variant_provider/plugin.py", provider)])
+        .build();
+    let trusted_index = context.temp_dir.child("trusted-index");
+    let trusted_package = trusted_index.child("variant-provider");
+    trusted_package.create_dir_all()?;
+    trusted_package.child(&filename).write_binary(&wheel)?;
+    trusted_package
+        .child("index.html")
+        .write_str(&format!(r#"<a href="{filename}">{filename}</a>"#))?;
+
+    let shadow_provider = indoc! {r#"
+        import os
+        from pathlib import Path
+        Path(os.environ["UV_TEST_PROVIDER_SENTINEL"]).touch()
+    "#};
+    let (shadow_filename, shadow_wheel) =
+        WheelBuilder::new(&"variant-provider".parse()?, &"2.0.0".parse()?)
+            .files(&[("variant_provider/plugin.py", shadow_provider)])
+            .build();
+    let shadow = context.temp_dir.child("shadow");
+    shadow.create_dir_all()?;
+    shadow.child(shadow_filename).write_binary(&shadow_wheel)?;
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [tool.uv]
+            find-links = ["shadow"]
+        "#})?;
+    let sentinel = context.temp_dir.child("shadow-provider-ran");
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("--variant-provider")
+        .arg("example=variant-provider@variant_provider.plugin:Provider")
+        .arg("--variant-provider-index")
+        .arg(trusted_index.path())
+        .arg("--index-url")
+        .arg(server.index_url())
+        .env("UV_TEST_PROVIDER_SENTINEL", sentinel.path())
+        .arg("ok==1.0.0"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + ok==1.0.0
+    ");
+    assert!(!sentinel.path().exists());
+    assert!(!context.site_packages().join("variant_provider").exists());
+    Ok(())
+}
+
 /// Local wheels must remain compatible when installed or cached.
 #[test]
 fn install_local_variant_wheel() -> Result<()> {
