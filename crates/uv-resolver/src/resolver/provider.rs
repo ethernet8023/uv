@@ -8,7 +8,8 @@ use uv_configuration::BuildOptions;
 use uv_distribution::{DistributionDatabase, Reporter};
 use uv_distribution_types::{
     Dist, File, IndexCapabilities, IndexLocations, IndexMetadata, IndexMetadataRef, IndexUrl,
-    InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython,
+    InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython, SupportedVariantProperties,
+    VariantsJsonContent,
 };
 use uv_normalize::PackageName;
 use uv_platform_tags::Tags;
@@ -80,6 +81,18 @@ pub trait ResolverProvider {
         file: &'io File,
         index: &'io IndexUrl,
     ) -> impl Future<Output = Result<VariantsJsonResponse, uv_client::Error>> + 'io;
+
+    /// Discover the target's supported variant properties.
+    fn supported_variant_properties<'io>(
+        &'io self,
+        metadata: &'io VariantsJsonContent,
+        require_hashes: bool,
+    ) -> impl Future<Output = Result<SupportedVariantProperties, uv_distribution::Error>> + 'io;
+
+    /// Whether this resolution installs a variant provider.
+    fn is_variant_provider(&self) -> bool {
+        false
+    }
 
     /// Set the [`Reporter`] to use for this installer.
     #[must_use]
@@ -184,6 +197,20 @@ impl<'a, Context: BuildContext> DefaultResolverProvider<'a, Context> {
 }
 
 impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Context> {
+    fn is_variant_provider(&self) -> bool {
+        self.fetcher.is_variant_provider()
+    }
+
+    async fn supported_variant_properties<'io>(
+        &'io self,
+        metadata: &'io VariantsJsonContent,
+        require_hashes: bool,
+    ) -> Result<SupportedVariantProperties, uv_distribution::Error> {
+        self.fetcher
+            .supported_variant_properties(metadata, require_hashes)
+            .await
+    }
+
     /// Make a "Simple API" request for the package and convert the result to a [`VersionMap`].
     async fn get_package_versions<'io>(
         &'io self,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{Level, trace};
 
 use uv_distribution_types::{
-    Dist, DistributionId, Identifier, IndexUrl, RegistryVariantsJson, ResolvedDist,
+    Dist, DistributionId, Identifier, IndexUrl, RegistryVariantsJson, ResolvedDist, SelectedVariant,
 };
 use uv_git::GitResolver;
 use uv_normalize::PackageName;
@@ -44,6 +44,15 @@ pub(crate) struct ResolvedFork {
 pub(crate) struct SelectedDistribution {
     version: Version,
     source: SelectedSource,
+    variant: Option<SelectedVariant>,
+}
+
+pub(crate) struct SelectedDistributionParts {
+    pub(crate) version: Version,
+    pub(crate) dist: ResolvedDist,
+    pub(crate) metadata: Option<Arc<MetadataResponse>>,
+    pub(crate) variants_json: Option<RegistryVariantsJson>,
+    pub(crate) variant: Option<SelectedVariant>,
 }
 
 #[derive(Debug)]
@@ -111,7 +120,11 @@ impl SelectedDistribution {
                     .map(|parsed| parsed.artifact.clone()),
             }
         };
-        Ok(Self { version, source })
+        Ok(Self {
+            variant: pins.variant(&package.name, &version).cloned(),
+            version,
+            source,
+        })
     }
 
     pub(crate) fn version(&self) -> &Version {
@@ -119,24 +132,22 @@ impl SelectedDistribution {
     }
 
     /// Move the selected artifact and metadata into the output graph.
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Version,
-        ResolvedDist,
-        Option<Arc<MetadataResponse>>,
-        Option<RegistryVariantsJson>,
-    ) {
-        match self.source {
-            SelectedSource::Url { dist, metadata, .. } => {
-                (self.version, dist, Some(metadata), None)
-            }
+    pub(crate) fn into_parts(self) -> SelectedDistributionParts {
+        let (dist, metadata, variants_json) = match self.source {
+            SelectedSource::Url { dist, metadata, .. } => (dist, Some(metadata), None),
             SelectedSource::Registry {
                 dist,
                 metadata,
                 variants_json,
                 ..
-            } => (self.version, dist, metadata, variants_json),
+            } => (dist, metadata, variants_json),
+        };
+        SelectedDistributionParts {
+            version: self.version,
+            dist,
+            metadata,
+            variants_json,
+            variant: self.variant,
         }
     }
 

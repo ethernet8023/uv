@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uv_distribution::Metadata;
 use uv_distribution_types::{
     BuiltDist, Dist, DistributionMetadata, IndexUrl, Name, RegistryVariantsJson, ResolvedDist,
-    SourceDist, VersionOrUrlRef,
+    SelectedVariant, SourceDist, VersionOrUrlRef,
 };
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::Version;
@@ -68,6 +68,8 @@ pub struct AnnotatedDist {
     pub metadata: Option<Arc<MetadataResponse>>,
     /// Verified index-level variant metadata for this package version.
     pub variants_json: Option<RegistryVariantsJson>,
+    /// The selected wheel properties used for dependency markers on this target.
+    pub variant: Option<SelectedVariant>,
     /// The role of this package relative to the resolver manifest.
     pub role: PackageRole,
     /// The "full" marker for this distribution. It precisely describes all

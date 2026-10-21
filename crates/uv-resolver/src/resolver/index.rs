@@ -2,7 +2,9 @@ use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use rustc_hash::FxHasher;
-use uv_distribution_types::{IndexUrl, RegistryVariantsJson, VariantsJsonContent};
+use uv_distribution_types::{
+    IndexUrl, RegistryVariantsJson, SupportedVariantProperties, VariantsJsonContent,
+};
 use uv_normalize::PackageName;
 use uv_once_map::{RegisteredEntry, RegisteredOnceMap};
 use uv_resolver_types::DistributionMetadataIndex;
@@ -26,6 +28,9 @@ struct SharedInMemoryIndex {
 
     /// A map from an index variant metadata file to its parsed contents.
     variants_json: FxOnceMap<RegistryVariantsJson, Arc<ParsedVariantsJsonResponse>>,
+
+    /// Target-specific properties discovered for verified variant metadata.
+    variant_properties: FxOnceMap<RegistryVariantsJson, Arc<SupportedVariantProperties>>,
 }
 
 #[derive(Debug)]
@@ -59,6 +64,12 @@ impl InMemoryIndex {
         &self,
     ) -> &FxOnceMap<RegistryVariantsJson, Arc<ParsedVariantsJsonResponse>> {
         &self.0.variants_json
+    }
+
+    pub(crate) fn variant_properties(
+        &self,
+    ) -> &FxOnceMap<RegistryVariantsJson, Arc<SupportedVariantProperties>> {
+        &self.0.variant_properties
     }
 
     /// Return exclusive access to distribution metadata when no cloned index can use it.

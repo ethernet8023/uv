@@ -433,6 +433,7 @@ impl From<ResolverOutput> for uv_distribution_types::Resolution {
 
         let mut transformed = Graph::with_capacity(graph.node_count(), graph.edge_count());
         let mut inverse = FxHashMap::with_capacity_and_hasher(graph.node_count(), FxBuildHasher);
+        let mut variants = Vec::new();
 
         // Create the root node.
         let root = transformed.add_node(Node::Root);
@@ -443,6 +444,12 @@ impl From<ResolverOutput> for uv_distribution_types::Resolution {
                 continue;
             };
             if dist.is_base() {
+                if let Some(variant) = &dist.variant
+                    && let ResolvedDist::Installable { dist: resolved, .. } = &dist.dist
+                    && let Dist::Built(built) = resolved.as_ref()
+                {
+                    variants.push((built.wheel_filename().clone(), variant.clone()));
+                }
                 inverse.insert(
                     &dist.name,
                     transformed.add_node(Node::Dist {
@@ -486,6 +493,8 @@ impl From<ResolverOutput> for uv_distribution_types::Resolution {
             }
         }
 
-        Self::new(transformed).with_diagnostics(diagnostics)
+        Self::new(transformed)
+            .with_diagnostics(diagnostics)
+            .with_variant_contexts(variants)
     }
 }

@@ -2,9 +2,10 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use uv_distribution_types::{DistributionId, Identifier, ResolvedDist};
+use uv_distribution_types::{DistributionId, Identifier, ResolvedDist, SelectedVariant};
 use uv_normalize::PackageName;
 use uv_pep440::Version;
+use uv_preview::PreviewFeature;
 
 use crate::ResolveError;
 use crate::candidate_selector::Candidate;
@@ -20,6 +21,8 @@ enum FilePin<'index> {
         metadata: PinMetadata<'index>,
         /// The index-level variant metadata for the selected package version.
         variants_json: Option<RegisteredVariantsJson<'index>>,
+        /// The selected wheel properties used for dependency markers.
+        variant: Option<SelectedVariant>,
     },
     Url(RegisteredMetadata<'index>),
 }
@@ -75,10 +78,29 @@ impl<'index> FilePins<'index> {
                 } else {
                     PinMetadata::Unrequested(dist.for_resolution().distribution_id())
                 };
+                let variant = match dist {
+                    CompatibleDist::InstalledDist(installed)
+                        if uv_preview::is_enabled(PreviewFeature::WheelVariants) =>
+                    {
+                        installed.read_variant_context().map_err(|error| {
+                            uv_distribution::Error::ReadInstalled(
+                                Box::new((*installed).clone()),
+                                error,
+                            )
+                        })?
+                    }
+                    CompatibleDist::InstalledDist(_)
+                    | CompatibleDist::SourceDist { .. }
+                    | CompatibleDist::IncompatibleWheel { .. } => None,
+                    CompatibleDist::CompatibleWheel { prioritized, .. } => {
+                        prioritized.selected_variant().cloned()
+                    }
+                };
                 entry.insert(FilePin::Registry {
                     dist: dist.for_installation().to_owned(),
                     metadata,
                     variants_json,
+                    variant,
                 });
             }
         }
@@ -132,6 +154,17 @@ impl<'index> FilePins<'index> {
     ) -> Option<&RegisteredVariantsJson<'index>> {
         match self.0.get(&(name.clone(), version.clone()))? {
             FilePin::Registry { variants_json, .. } => variants_json.as_ref(),
+            FilePin::Url(_) => None,
+        }
+    }
+
+    pub(crate) fn variant(
+        &self,
+        name: &PackageName,
+        version: &Version,
+    ) -> Option<&SelectedVariant> {
+        match self.0.get(&(name.clone(), version.clone()))? {
+            FilePin::Registry { variant, .. } => variant.as_ref(),
             FilePin::Url(_) => None,
         }
     }
