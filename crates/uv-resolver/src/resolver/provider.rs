@@ -356,7 +356,7 @@ impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Con
             .managed(|client| client.fetch_variants_json(package_name, file, index))
             .await
         {
-            Ok(contents) => Ok(VariantsJsonResponse::Found(contents)),
+            Ok(fetched) => Ok(VariantsJsonResponse::Found(fetched.contents)),
             Err(error) => match self.classify_metadata_error(error, Some(index)) {
                 Ok(reason) => Ok(VariantsJsonResponse::Unavailable(reason)),
                 Err(error) => Err(error),
