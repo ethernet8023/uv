@@ -515,6 +515,11 @@ pub async fn run(cli: Cli, global_initialization: GlobalInitialization) -> Resul
     // Only an explicit user option can authorize running a variant provider. In particular, a
     // project cannot grant that permission by enabling the preview or through its configuration.
     let args = &cli.top_level.global_args;
+    // Check this after clap has combined global options across subcommands. The provider index
+    // can come from the environment while the provider is named on the command line.
+    if args.variant_provider_index.is_some() && args.variant_provider.is_empty() {
+        bail!("`--variant-provider-index` requires `--variant-provider`");
+    }
     if args.variant_target.is_some() || !args.variant_provider.is_empty() {
         if !globals.preview.is_enabled(PreviewFeature::WheelVariants) {
             bail!("Wheel variant options require `--preview-features wheel-variants`");

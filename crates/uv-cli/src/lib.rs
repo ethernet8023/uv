@@ -334,8 +334,9 @@ pub struct GlobalArgs {
         global = true,
         long,
         env = EnvVars::UV_VARIANT_PROVIDER_INDEX,
+        hide_env_values = true,
         value_name = "URL",
-        requires = "variant_provider",
+        value_parser = VariantProviderIndexValueParser,
         hide = true,
     )]
     pub variant_provider_index: Option<IndexUrl>,
@@ -660,6 +661,31 @@ pub struct VersionArgs {
         value_hint = ValueHint::Other,
     )]
     python: Option<Maybe<String>>,
+}
+
+/// Parse a provider index without including a rejected URL or its credentials in the error.
+#[derive(Clone, Debug)]
+struct VariantProviderIndexValueParser;
+
+impl TypedValueParser for VariantProviderIndexValueParser {
+    type Value = IndexUrl;
+
+    fn parse_ref(
+        &self,
+        command: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        value
+            .to_str()
+            .and_then(|value| IndexUrl::from_str(value).ok())
+            .ok_or_else(|| {
+                command.clone().error(
+                    ErrorKind::InvalidValue,
+                    "expected an index URL or path for `--variant-provider-index`",
+                )
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
