@@ -7,9 +7,9 @@ use uv_client::{FetchedVariantsJson, MetadataFormat};
 use uv_configuration::BuildOptions;
 use uv_distribution::{DistributionDatabase, Reporter};
 use uv_distribution_types::{
-    Dist, File, IndexCapabilities, IndexLocations, IndexMetadata, IndexMetadataRef, IndexUrl,
-    InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython, SupportedVariantProperties,
-    VariantsJsonContent,
+    BuiltDist, Dist, File, IndexCapabilities, IndexLocations, IndexMetadata, IndexMetadataRef,
+    IndexUrl, InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython, SelectedVariant,
+    SupportedVariantProperties, VariantsJsonContent,
 };
 use uv_normalize::PackageName;
 use uv_platform_tags::Tags;
@@ -88,6 +88,12 @@ pub trait ResolverProvider {
         metadata: &'io VariantsJsonContent,
         require_hashes: bool,
     ) -> impl Future<Output = Result<SupportedVariantProperties, uv_distribution::Error>> + 'io;
+
+    /// Select a direct wheel's supported properties after verifying the wheel.
+    fn select_wheel_variant<'io>(
+        &'io self,
+        dist: &'io BuiltDist,
+    ) -> impl Future<Output = Result<Option<SelectedVariant>, uv_distribution::Error>> + 'io;
 
     /// Whether this resolution installs a variant provider.
     fn is_variant_provider(&self) -> bool {
@@ -208,6 +214,15 @@ impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Con
 
     fn variant_target(&self) -> Option<&SupportedVariantProperties> {
         self.fetcher.variant_target()
+    }
+
+    async fn select_wheel_variant<'io>(
+        &'io self,
+        dist: &'io BuiltDist,
+    ) -> Result<Option<SelectedVariant>, uv_distribution::Error> {
+        self.fetcher
+            .select_wheel_variant(dist, self.hasher.archive_policy(dist))
+            .await
     }
 
     async fn supported_variant_properties<'io>(

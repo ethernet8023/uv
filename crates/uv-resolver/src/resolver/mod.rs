@@ -25,8 +25,8 @@ use uv_distribution::{ArchiveMetadata, DistributionDatabase, InstalledWheelVaria
 use uv_distribution_types::{
     BuiltDist, DerivationChain, Dist, DistErrorKind, Identifier, IndexCapabilities, IndexLocations,
     IndexMetadata, IndexUrl, InstalledDist, Name, RegistryVariantsJson, RemoteSource, Requirement,
-    RequiresPython, ResolutionRecorder, ResolvedDist, SourceDist, SupportedVariantProperties,
-    VariantsJsonContent, VersionOrUrlRef,
+    RequiresPython, ResolutionRecorder, ResolvedDist, SelectedVariant, SourceDist,
+    SupportedVariantProperties, VariantsJsonContent, VersionOrUrlRef,
 };
 use uv_git::GitResolver;
 use uv_normalize::PackageName;
@@ -34,7 +34,7 @@ use uv_pep440::{MIN_VERSION, Version, VersionSpecifiers, release_specifiers_to_r
 use uv_pep508::{
     MarkerEnvironment, MarkerExpression, MarkerOperator, MarkerTree, MarkerValueString,
 };
-use uv_platform_tags::{IncompatibleTag, Tags};
+use uv_platform_tags::{IncompatibleTag, TagCompatibility, Tags};
 use uv_preview::PreviewFeature;
 use uv_pypi_types::{ConflictItem, ConflictItemRef, ConflictKindRef, Conflicts, VerbatimParsedUrl};
 use uv_resolver_types::{PackageNodeKind, VariantsJsonMetadataError};
@@ -74,7 +74,7 @@ use crate::resolver::environment::{
     ForkingPossibility, fork_version_by_marker, fork_version_by_python_requirement,
 };
 pub(crate) use crate::resolver::fork_map::{ForkMap, ForkSet};
-pub use crate::resolver::index::InMemoryIndex;
+pub use crate::resolver::index::{DirectWheelVariantIndex, InMemoryIndex};
 use crate::resolver::index::{ParsedVariantsJson, ParsedVariantsJsonResponse};
 use crate::resolver::indexes::Indexes;
 use crate::resolver::package_source::PackageSource;
@@ -1255,8 +1255,18 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 }
             }
 
-            let incompatible_tag = (!python_requirement.target().matches_wheel_tag(filename))
-                .then_some(IncompatibleTag::AbiPythonVersion);
+            let incompatible_tag = if !python_requirement.target().matches_wheel_tag(filename) {
+                Some(IncompatibleTag::AbiPythonVersion)
+            } else if filename.variant().is_some()
+                && let Some(tags) = &self.tags
+            {
+                match filename.tag_compatibility(tags) {
+                    TagCompatibility::Compatible(_) => None,
+                    TagCompatibility::Incompatible(tag) => Some(tag),
+                }
+            } else {
+                None
+            };
             if let Some(tag) = incompatible_tag {
                 return Ok(Some(ResolverVersion::Unavailable(
                     filename.version.clone(),
@@ -1284,7 +1294,15 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             }
         }
 
-        pins.insert_url(name, version, registered);
+        let variant = if env.marker_environment().is_some()
+            && let Dist::Built(built) = &dist
+            && built.wheel_filename().variant().is_some()
+        {
+            requests.select_direct_variant(built)?
+        } else {
+            None
+        };
+        pins.insert_url(name, version, registered, variant);
         Ok(Some(ResolverVersion::Unforked(version.clone())))
     }
 
@@ -2287,6 +2305,11 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                         .variant_properties()
                         .done(parsed.artifact.clone(), Arc::new(properties));
                 }
+                Some(Response::DirectVariant { dist, variant }) => {
+                    self.index
+                        .direct_variants()
+                        .done(dist.distribution_id(), variant);
+                }
                 None => {}
             }
         }
@@ -2301,6 +2324,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         provider: &Provider,
     ) -> Result<Option<Response>, ResolveError> {
         match request {
+            Request::DirectVariant(dist) => {
+                let variant = provider.select_wheel_variant(&dist).await.map_err(Arc::new);
+                Ok(Some(Response::DirectVariant { dist, variant }))
+            }
             Request::VariantProperties(parsed) => {
                 let require_hashes = self
                     .hasher
@@ -3549,6 +3576,8 @@ pub(crate) enum Request {
     VariantsJson(RegistryVariantsJson),
     /// A request to discover target-specific properties for verified metadata.
     VariantProperties(Arc<ParsedVariantsJson>),
+    /// A request to select the supported properties of a direct wheel.
+    DirectVariant(BuiltDist),
     /// A request to pre-fetch the metadata for a package and the best-guess distribution.
     Prefetch(PackageName, Range<Version>, PythonRequirement),
 }
@@ -3608,6 +3637,7 @@ impl Display for Request {
             Self::VariantProperties(parsed) => {
                 write!(f, "Variant properties `{}`", parsed.artifact.filename)
             }
+            Self::DirectVariant(dist) => write!(f, "Direct wheel variant `{dist}`"),
             Self::Prefetch(package_name, range, _) => {
                 write!(f, "Prefetch {package_name} {range}")
             }
@@ -3639,6 +3669,11 @@ enum Response {
     VariantProperties {
         parsed: Arc<ParsedVariantsJson>,
         properties: SupportedVariantProperties,
+    },
+    /// The selected properties for a direct wheel.
+    DirectVariant {
+        dist: BuiltDist,
+        variant: Result<Option<SelectedVariant>, Arc<uv_distribution::Error>>,
     },
 }
 
