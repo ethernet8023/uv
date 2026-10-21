@@ -6092,13 +6092,22 @@ enum TagPolicy<'tags> {
     /// Prefer wheels that match the specified platform tags, but fall back to incompatible wheels
     /// if necessary.
     Preferred(&'tags Tags),
+    /// Require matching platform tags while deferring variant compatibility to artifact selection.
+    Variant(&'tags Tags),
 }
 
 impl<'tags> TagPolicy<'tags> {
     /// Returns the platform tags to consider.
     fn tags(&self) -> &'tags Tags {
         match self {
-            Self::Required(tags) | Self::Preferred(tags) => tags,
+            Self::Required(tags) | Self::Preferred(tags) | Self::Variant(tags) => tags,
+        }
+    }
+
+    fn compatibility(self, filename: &WheelFilename) -> TagCompatibility {
+        match self {
+            Self::Required(tags) | Self::Preferred(tags) => filename.compatibility(tags),
+            Self::Variant(tags) => filename.tag_compatibility(tags),
         }
     }
 }
@@ -7299,7 +7308,7 @@ impl Package {
         let mut best: Option<(WheelPriority, usize)> = None;
         for (i, wheel) in self.wheels.iter().enumerate() {
             let TagCompatibility::Compatible(tag_priority) =
-                wheel.filename.compatibility(tag_policy.tags())
+                tag_policy.compatibility(&wheel.filename)
             else {
                 continue;
             };
@@ -7319,7 +7328,7 @@ impl Package {
 
         let best = best.map(|(_, i)| i);
         match tag_policy {
-            TagPolicy::Required(_) => best,
+            TagPolicy::Required(_) | TagPolicy::Variant(_) => best,
             TagPolicy::Preferred(_) => best.or_else(|| self.wheels.first().map(|_| 0)),
         }
     }

@@ -311,12 +311,21 @@ pub trait Installable<'lock> {
                     continue;
                 }
                 let package = self.lock().package(index);
+                let default_build_options = BuildOptions::default();
+                let build_options = if install {
+                    build_options
+                } else {
+                    &default_build_options
+                };
                 let to_node = |package: &Package| {
-                    if install {
-                        self.installable_node(package, tags, marker_env, build_options)
-                    } else {
-                        self.non_installable_node(package, tags, marker_env)
-                    }
+                    node_from_package(
+                        self,
+                        package,
+                        TagPolicy::Variant(tags),
+                        marker_env,
+                        build_options,
+                        install,
+                    )
                 };
                 let node = to_node(package)?;
                 let selected = select_variant(
@@ -353,28 +362,14 @@ pub trait Installable<'lock> {
         marker_env: &ResolverMarkerEnvironment,
         build_options: &BuildOptions,
     ) -> Result<Node, LockError> {
-        let tag_policy = TagPolicy::Required(tags);
-        let HashedDist { dist, hashes } = package.to_dist(
-            self.install_path(),
-            tag_policy,
-            build_options,
+        node_from_package(
+            self,
+            package,
+            TagPolicy::Required(tags),
             marker_env,
-            if self.lock().is_workspace_member(package) {
-                FirstParty::Yes
-            } else {
-                FirstParty::No
-            },
-        )?;
-        let version = package.version().cloned();
-        let dist = ResolvedDist::Installable {
-            dist: Arc::new(dist),
-            version,
-        };
-        Ok(Node::Dist {
-            dist,
-            hashes,
-            install: true,
-        })
+            build_options,
+            true,
+        )
     }
 
     /// Create a non-installable [`Node`] from a [`Package`].
@@ -384,24 +379,14 @@ pub trait Installable<'lock> {
         tags: &Tags,
         marker_env: &ResolverMarkerEnvironment,
     ) -> Result<Node, LockError> {
-        let HashedDist { dist, .. } = package.to_dist(
-            self.install_path(),
+        node_from_package(
+            self,
+            package,
             TagPolicy::Preferred(tags),
-            &BuildOptions::default(),
             marker_env,
-            FirstParty::No,
-        )?;
-        let version = package.version().cloned();
-        let dist = ResolvedDist::Installable {
-            dist: Arc::new(dist),
-            version,
-        };
-        let hashes = package.hashes();
-        Ok(Node::Dist {
-            dist,
-            hashes,
-            install: false,
-        })
+            &BuildOptions::default(),
+            false,
+        )
     }
 
     /// Convert a lockfile entry to a graph [`Node`].
@@ -1226,6 +1211,35 @@ trait InstallableExt<'lock>: Installable<'lock> {
     }
 }
 
+fn node_from_package<'lock>(
+    target: &(impl Installable<'lock> + ?Sized),
+    package: &Package,
+    tag_policy: TagPolicy<'_>,
+    marker_env: &ResolverMarkerEnvironment,
+    build_options: &BuildOptions,
+    install: bool,
+) -> Result<Node, LockError> {
+    let HashedDist { dist, hashes } = package.to_dist(
+        target.install_path(),
+        tag_policy,
+        build_options,
+        marker_env,
+        if install && target.lock().is_workspace_member(package) {
+            FirstParty::Yes
+        } else {
+            FirstParty::No
+        },
+    )?;
+    Ok(Node::Dist {
+        dist: ResolvedDist::Installable {
+            dist: Arc::new(dist),
+            version: package.version().cloned(),
+        },
+        hashes: if install { hashes } else { package.hashes() },
+        install,
+    })
+}
+
 impl<'lock, T> InstallableExt<'lock> for T where T: Installable<'lock> + ?Sized {}
 
 /// An [`Installable`] adapter for materializing concrete packages directly from a [`Lock`].
@@ -1629,7 +1643,7 @@ async fn select_variant<Context: BuildContext>(
         BuiltDist::Registry(registry) => {
             let has_candidate = registry.wheels.iter().any(|wheel| {
                 wheel.filename.variant().is_some()
-                    && wheel.filename.compatibility(tags).is_compatible()
+                    && wheel.filename.tag_compatibility(tags).is_compatible()
             });
             if !has_candidate {
                 let ordinary = registry.best_wheel().filename.variant().is_none();
@@ -1652,6 +1666,26 @@ async fn select_variant<Context: BuildContext>(
                     error,
                 }
             })?;
+            let candidates = registry
+                .wheels
+                .iter()
+                .enumerate()
+                .filter(|(_, wheel)| wheel.index == sidecar.index)
+                .filter_map(|(index, wheel)| {
+                    let label = wheel.filename.variant()?;
+                    if !metadata.contains_variant(label) {
+                        return None;
+                    }
+                    let compatibility = wheel.filename.tag_compatibility(tags);
+                    compatibility
+                        .is_compatible()
+                        .then_some((index, compatibility))
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                let ordinary = registry.best_wheel().filename.variant().is_none();
+                return Ok(ordinary.then_some((node, None)));
+            }
             let supported = database
                 .supported_variant_properties(&metadata, require_provider_hashes)
                 .await
@@ -1659,16 +1693,10 @@ async fn select_variant<Context: BuildContext>(
                     package_id: package.id.clone(),
                     error,
                 })?;
-            let selected = registry
-                .wheels
-                .iter()
-                .enumerate()
-                .filter(|(_, wheel)| wheel.index == sidecar.index)
-                .filter_map(|(index, wheel)| {
-                    let compatibility = wheel.filename.compatibility(tags);
-                    if !compatibility.is_compatible() {
-                        return None;
-                    }
+            let selected = candidates
+                .into_iter()
+                .filter_map(|(index, compatibility)| {
+                    let wheel = &registry.wheels[index];
                     let label = wheel.filename.variant()?;
                     let score = metadata.score_variant(label, &supported)?;
                     Some((
@@ -1706,6 +1734,9 @@ async fn select_variant<Context: BuildContext>(
             let Some(metadata) = metadata else {
                 return Ok(None);
             };
+            if !metadata.contains_variant(label) {
+                return Ok(None);
+            }
             let supported = database
                 .supported_variant_properties(&metadata, require_provider_hashes)
                 .await

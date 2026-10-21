@@ -1082,6 +1082,60 @@ fn universal_lock_preserves_variant_wheels() -> Result<()> {
     Ok(())
 }
 
+/// An unselected variant requires preview but does not require loading project indexes.
+#[test]
+fn frozen_sync_with_unselected_variant() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        gpu = ["variant"]
+    "#})?;
+    context.temp_dir.child("uv.lock").write_str(indoc! {r#"
+        version = 1
+        revision = 5
+        requires-python = ">=3.12"
+
+        [[package]]
+        name = "project"
+        version = "1.0.0"
+        source = { virtual = "." }
+
+        [package.optional-dependencies]
+        gpu = [{ name = "variant" }]
+
+        [[package]]
+        name = "variant"
+        version = "1.0.0"
+        source = { registry = "https://example.com/simple" }
+
+        [[package.wheels]]
+        url = "https://example.com/variant-1.0.0-py3-none-any-null.whl"
+        hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.sync()
+        .args(["--frozen", "--find-links", "missing"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: This lockfile uses wheel variants; pass `--preview-features wheel-variants` to use it
+    ");
+    uv_snapshot!(context.filters(), context.sync()
+        .args(["--frozen", "--find-links", "missing", "--preview-features", "wheel-variants"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Checked in [TIME]
+    ");
+    Ok(())
+}
+
 #[tokio::test]
 async fn registry_variant_wheels_are_not_selectable() -> Result<()> {
     let server = MockServer::start().await;
@@ -1191,8 +1245,44 @@ fn frozen_sync_authenticates_reachable_variant_metadata() -> Result<()> {
     ----- stderr -----
     Resolved 3 packages in [TIME]
     ");
-    sidecar.write_str("tampered")?;
-    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("cpu"), @"");
-    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("gpu"), @"");
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("gpu"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + ok==1.0.0
+    ");
+    let changed_metadata = "tampered";
+    sidecar.write_str(changed_metadata)?;
+    let context = context
+        .with_filter((
+            hex::encode(Sha256::digest(metadata.as_bytes())),
+            "[LOCKED_SIDECAR_HASH]",
+        ))
+        .with_filter((
+            hex::encode(Sha256::digest(changed_metadata.as_bytes())),
+            "[CHANGED_SIDECAR_HASH]",
+        ));
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("cpu"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Prepared 1 package in [TIME]
+    Uninstalled 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - ok==1.0.0
+     + ok==2.0.0
+    ");
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("gpu"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Failed to fetch wheel variant metadata for `ok==1.0.0 @ registry+links`
+      cause: Hash mismatch for package metadata at `file://[TEMP_DIR]/links/ok-1.0.0-variants.json`
+
+             Expected:
+               sha256:[LOCKED_SIDECAR_HASH]
+
+             Computed:
+               sha256:[CHANGED_SIDECAR_HASH]
+    ");
     Ok(())
 }

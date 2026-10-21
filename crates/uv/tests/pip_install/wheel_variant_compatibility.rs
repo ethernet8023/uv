@@ -576,8 +576,7 @@ fn explicit_variant_target_replaces_installed_wheel_during_resolution() -> Resul
     Ok(())
 }
 
-/// Project sync installs the wheel selected by the lockfile even if another compatible variant
-/// is already installed.
+/// Project sync replaces an installed variant when the target selects an ordinary wheel.
 #[test]
 fn sync_replaces_compatible_variant_with_selected_wheel() -> Result<()> {
     let context = uv_test::test_context!("3.12");
@@ -588,8 +587,9 @@ fn sync_replaces_compatible_variant_with_selected_wheel() -> Result<()> {
 
         [packages.ok.versions."1.0.0"]
         sdist = false
-        variants.namespaces = ["x86_64"]
-        variants.wheels.null.properties = []
+        variants.namespaces = ["blas_lapack"]
+        variants.providers.blas_lapack.static-properties.library = ["openblas"]
+        variants.wheels.blas.properties = ["blas_lapack :: library :: openblas"]
     "#})?;
     let server = PackseServer::from_scenario(&scenario);
     let installed_variant = context
@@ -621,11 +621,15 @@ fn sync_replaces_compatible_variant_with_selected_wheel() -> Result<()> {
     ");
     assert!(installed_variant.is_file());
 
+    let target = context.temp_dir.child("empty-target.json");
+    target.write_str("{}")?;
     uv_snapshot!(context.filters(), context.sync()
         .arg("--index-url")
         .arg(server.index_url())
         .arg("--preview-features")
-        .arg("wheel-variants"), @"
+        .arg("wheel-variants")
+        .arg("--variant-target")
+        .arg(target.path()), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
@@ -688,7 +692,7 @@ fn sync_replaces_compatible_variant_with_selected_sdist() -> Result<()> {
     ");
     assert!(installed_variant.is_file());
 
-    uv_snapshot!(context.filters(), context.sync(), @"
+    uv_snapshot!(context.filters(), context.sync().arg("--no-binary-package").arg("ok"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]

@@ -4,7 +4,7 @@ use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_command_support::Printer;
 use uv_configuration::{
-    Concurrency, DependencyGroupsWithDefaults, DryRun, EditableMode,
+    Concurrency, Constraints, DependencyGroupsWithDefaults, DryRun, EditableMode,
     ExtrasSpecificationWithDefaults, HashCheckingMode, InstallOptions, Modifications, TargetTriple,
 };
 use uv_dispatch::{BuildDispatch, PlatformState};
@@ -16,7 +16,7 @@ use uv_install_operations::{BytecodeCompilation, Changelog, InstallationPlan};
 use uv_installer::{InstallationStrategy, SitePackages};
 use uv_lock::Installable;
 use uv_pep508::{MarkerTree, VersionOrUrl};
-use uv_preview::Preview;
+use uv_preview::{Preview, PreviewFeature};
 use uv_pypi_types::{ParsedArchiveUrl, ParsedGitDirectoryUrl, ParsedGitPathUrl, ParsedUrl};
 use uv_python_interpreter::PythonEnvironment;
 use uv_resolve_operations::{resolution_markers, resolution_tags};
@@ -56,6 +56,11 @@ pub async fn sync_from_lock(
     preview: Preview,
     malware_context: MalwareCheckContext<'_>,
 ) -> Result<Changelog, EnvironmentError> {
+    let has_variants = target.has_variants();
+    if has_variants && !preview.is_enabled(PreviewFeature::WheelVariants) {
+        return Err(EnvironmentError::WheelVariantsPreview);
+    }
+
     // Extract the project settings.
     let InstallerSettingsRef {
         variant_policy,
@@ -211,19 +216,6 @@ pub async fn sync_from_lock(
             .platform(venv.interpreter().platform())
             .build()
     };
-    let build_hashes = || -> Result<_, EnvironmentError> {
-        let constraints = target.build_constraints();
-        let constraint_hashes = HashStrategy::from_constraints(
-            &constraints,
-            Some(&venv.interpreter().to_resolver_marker_environment()),
-            build_hash_checking,
-        )?;
-        let hashes = target
-            .lock()
-            .hash_strategy(target.install_path(), &FxHashSet::default())?
-            .with_constraint_hashes(&constraint_hashes)?;
-        Ok((constraints, hashes))
-    };
     let build_isolation = match build_isolation {
         uv_configuration::BuildIsolation::Isolate => BuildIsolation::Isolated,
         uv_configuration::BuildIsolation::Shared => BuildIsolation::Shared(venv),
@@ -231,71 +223,68 @@ pub async fn sync_from_lock(
             BuildIsolation::SharedPackage(venv, packages)
         }
     };
-    let variant_resources = if target.has_variants() {
-        let client = build_client()?;
-        let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
-        let (build_constraints, build_hasher) = build_hashes()?;
-        Some((client, flat_index, build_constraints, build_hasher))
-    } else {
-        None
-    };
-    let resolution =
-        if let Some((client, flat_index, build_constraints, build_hasher)) = &variant_resources {
-            let build_dispatch = BuildDispatch::new(
-                client,
-                cache,
-                build_constraints,
-                venv.interpreter(),
-                index_locations,
-                flat_index,
-                dependency_metadata,
-                state.clone().into_inner(),
-                index_strategy,
-                config_setting,
-                config_settings_package,
-                build_isolation,
-                &extra_build_requires,
-                extra_build_variables,
-                link_mode,
-                build_options,
-                build_hasher,
-                exclude_newer.clone(),
-                sources.clone(),
-                SourceTreeEditablePolicy::Project,
-                workspace_cache.clone(),
-                concurrency.clone(),
-                preview,
-            )
-            .with_variant_policy(variant_policy);
-            let database = DistributionDatabase::new(
-                client,
-                &build_dispatch,
-                concurrency.downloads_semaphore.clone(),
-            );
-            target
-                .to_resolution_with_variants(
-                    &marker_env,
-                    &tags,
-                    extras,
-                    groups,
-                    build_options,
-                    &install_options,
-                    client,
-                    &database,
-                    cache,
-                    build_hash_checking.is_require(),
-                )
-                .await?
-        } else {
-            target.to_resolution(
+    let variant_client = has_variants.then(build_client).transpose()?;
+    let resolution = if let Some(client) = &variant_client {
+        // Provider dependencies use an isolated resolver, so selection does not need the
+        // project's build constraints, hashes, or flat indexes.
+        let build_constraints = Constraints::default();
+        let build_hasher = HashStrategy::default();
+        let flat_index = FlatIndex::default();
+        let build_dispatch = BuildDispatch::new(
+            client,
+            cache,
+            &build_constraints,
+            venv.interpreter(),
+            index_locations,
+            &flat_index,
+            dependency_metadata,
+            state.clone().into_inner(),
+            index_strategy,
+            config_setting,
+            config_settings_package,
+            build_isolation,
+            &extra_build_requires,
+            extra_build_variables,
+            link_mode,
+            build_options,
+            &build_hasher,
+            exclude_newer.clone(),
+            sources.clone(),
+            SourceTreeEditablePolicy::Project,
+            workspace_cache.clone(),
+            concurrency.clone(),
+            preview,
+        )
+        .with_variant_policy(variant_policy);
+        let database = DistributionDatabase::new(
+            client,
+            &build_dispatch,
+            concurrency.downloads_semaphore.clone(),
+        );
+        target
+            .to_resolution_with_variants(
                 &marker_env,
                 &tags,
                 extras,
                 groups,
                 build_options,
                 &install_options,
-            )?
-        };
+                client,
+                &database,
+                cache,
+                build_hash_checking.is_require(),
+            )
+            .await?
+    } else {
+        target.to_resolution(
+            &marker_env,
+            &tags,
+            extras,
+            groups,
+            build_options,
+            &install_options,
+        )?
+    };
 
     // Always skip virtual projects, which shouldn't be built or installed.
     let resolution = apply_no_virtual_project(resolution);
@@ -352,15 +341,21 @@ pub async fn sync_from_lock(
         )?);
     }
 
-    let (client, flat_index, build_constraints, build_hasher) =
-        if let Some(resources) = variant_resources {
-            resources
-        } else {
-            let client = build_client()?;
-            let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
-            let (build_constraints, build_hasher) = build_hashes()?;
-            (client, flat_index, build_constraints, build_hasher)
-        };
+    let client = match variant_client {
+        Some(client) => client,
+        None => build_client()?,
+    };
+    let flat_index = FlatIndex::load(&client, cache, index_locations).await?;
+    let build_constraints = target.build_constraints();
+    let constraint_hashes = HashStrategy::from_constraints(
+        &build_constraints,
+        Some(&venv.interpreter().to_resolver_marker_environment()),
+        build_hash_checking,
+    )?;
+    let build_hasher = target
+        .lock()
+        .hash_strategy(target.install_path(), &FxHashSet::default())?
+        .with_constraint_hashes(&constraint_hashes)?;
 
     // Create a build dispatch.
     let build_dispatch = BuildDispatch::new(
