@@ -2,7 +2,7 @@ use std::io::{self, BufReader, Seek};
 use std::path::PathBuf;
 
 use futures::TryStreamExt;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use uv_cache::{Cache, CacheBucket, CacheEntry, WheelCache};
@@ -28,12 +28,14 @@ enum WheelLocation {
 /// Read the variant metadata from a locked wheel after authenticating it against the lockfile.
 ///
 /// Uses the same wheel cache as installation. A downloaded wheel is hashed in full before any ZIP
-/// entry is parsed. This function does not query variant providers.
+/// entry is parsed, and its download is bounded by the locked size when available. This function
+/// does not query variant providers.
 pub async fn read_locked_wheel_variant(
     client: &RegistryClient,
     cache: &Cache,
     dist: &BuiltDist,
     hashes: &[HashDigest],
+    expected_size: Option<u64>,
 ) -> Result<Option<VariantsJsonContent>, Error> {
     let filename = dist.wheel_filename();
     let Some(label) = filename.variant() else {
@@ -76,7 +78,9 @@ pub async fn read_locked_wheel_variant(
     );
     let _lock = lock_wheel(&wheel_entry, filename).await?;
 
-    let archive = if let Some(archive) = cached_fragment_wheel(client, cache, dist, policy)? {
+    let archive = if let Some(archive) =
+        cached_fragment_wheel(client, cache, dist, policy, expected_size)?
+    {
         archive
     } else {
         match location {
@@ -86,15 +90,22 @@ pub async fn read_locked_wheel_variant(
                 if let Some(archive) = PathArchivePointer::read_from(&pointer_entry)?
                     .filter(|pointer| pointer.is_up_to_date(modified))
                     .map(PathArchivePointer::into_archive)
-                    .filter(|archive| archive.has_digests(policy) && archive.exists(cache))
+                    .filter(|archive| reusable_archive(archive, cache, policy, expected_size))
                 {
                     archive
                 } else {
                     let file = fs_err::tokio::File::open(&path)
                         .await
                         .map_err(Error::CacheRead)?;
-                    let archive =
-                        cache_authenticated_wheel(file, cache, &wheel_entry, dist, policy).await?;
+                    let archive = cache_authenticated_wheel(
+                        file,
+                        cache,
+                        &wheel_entry,
+                        dist,
+                        policy,
+                        expected_size,
+                    )
+                    .await?;
                     PathArchivePointer::new(modified, archive.clone())
                         .write_to(&pointer_entry)
                         .await?;
@@ -124,14 +135,21 @@ pub async fn read_locked_wheel_variant(
                         .map_err(io::Error::other)
                         .into_async_read()
                         .compat();
-                    cache_authenticated_wheel(reader, cache, &wheel_entry, dist, policy)
+                    cache_authenticated_wheel(
+                        reader,
+                        cache,
+                        &wheel_entry,
+                        dist,
+                        policy,
+                        expected_size,
+                    )
                 };
                 let archive: Archive = client
                     .cached_client()
                     .get_serde_with_retry(request()?, &http_entry, control.clone(), download)
                     .await
                     .map_err(cache_error)?;
-                if archive.has_digests(policy) && archive.exists(cache) {
+                if reusable_archive(&archive, cache, policy, expected_size) {
                     archive
                 } else {
                     client
@@ -150,6 +168,9 @@ pub async fn read_locked_wheel_variant(
             archive.hashes(),
         ));
     }
+    if let Some(actual_size) = archive.size {
+        validate_size(dist, expected_size, actual_size)?;
+    }
     let path = cache.archive(&archive.id);
     let stem = uv_metadata::find_flat_dist_info(filename, &path)
         .map_err(|err| Error::LockedWheelVariant(dist.to_string(), Box::new(err)))?;
@@ -167,6 +188,7 @@ fn cached_fragment_wheel(
     cache: &Cache,
     dist: &BuiltDist,
     policy: ArchiveHashPolicy<'_>,
+    expected_size: Option<u64>,
 ) -> Result<Option<Archive>, Error> {
     let BuiltDist::DirectUrl(wheel) = dist else {
         return Ok(None);
@@ -185,12 +207,38 @@ fn cached_fragment_wheel(
         if let Some(archive) = HttpArchivePointer::read_from(&entry)?
             .map(HttpArchivePointer::into_archive)
             .filter(|archive| archive.filename == wheel.filename)
-            .filter(|archive| archive.satisfies(policy) && archive.exists(cache))
+            .filter(|archive| {
+                archive.satisfies(policy) && reusable_archive(archive, cache, policy, expected_size)
+            })
         {
             return Ok(Some(archive));
         }
     }
     Ok(None)
+}
+
+fn reusable_archive(
+    archive: &Archive,
+    cache: &Cache,
+    policy: ArchiveHashPolicy<'_>,
+    expected_size: Option<u64>,
+) -> bool {
+    archive.has_digests(policy)
+        && archive.exists(cache)
+        && (expected_size.is_none() || archive.size.is_some())
+}
+
+fn validate_size(dist: &BuiltDist, expected: Option<u64>, actual: u64) -> Result<(), Error> {
+    if let Some(expected) = expected
+        && expected != actual
+    {
+        return Err(Error::MismatchedSize {
+            distribution: dist.to_string(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn cache_error(err: CachedClientError<Error>) -> Error {
@@ -207,6 +255,7 @@ async fn cache_authenticated_wheel(
     wheel_entry: &CacheEntry,
     dist: &BuiltDist,
     policy: ArchiveHashPolicy<'_>,
+    expected_size: Option<u64>,
 ) -> Result<Archive, Error> {
     let file = tempfile::tempfile_in(cache.root()).map_err(Error::CacheWrite)?;
     let mut file = tokio::io::BufWriter::new(fs_err::tokio::File::from_std(
@@ -216,10 +265,12 @@ async fn cache_authenticated_wheel(
         .into_iter()
         .map(Hasher::from)
         .collect::<Vec<_>>();
-    let mut reader = HashReader::new(reader, &mut hashers);
+    let limit = expected_size.map_or(u64::MAX, |size| size.saturating_add(1));
+    let mut reader = HashReader::new(reader.take(limit), &mut hashers);
     let size = tokio::io::copy(&mut reader, &mut file)
         .await
         .map_err(Error::HashExhaustion)?;
+    validate_size(dist, expected_size, size)?;
     file.flush().await.map_err(Error::CacheWrite)?;
     let hashes = validate_hashes(dist, policy, hashers)?;
     let mut file = file.into_inner().into_std().await;

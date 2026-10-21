@@ -1264,6 +1264,7 @@ impl<'lock> PylockToml {
                     cache,
                     &dist,
                     hashes.as_slice(),
+                    archive.size,
                 )
                 .await
                 .map_err(|err| {
@@ -1586,11 +1587,7 @@ impl<'lock> PylockToml {
                 let metadata = package.variants_json.as_ref().ok_or_else(|| {
                     PylockTomlErrorKind::MissingVariantMetadata(package.name.clone())
                 })?;
-                if !no_binary
-                    && variant_filenames
-                        .iter()
-                        .any(|filename| filename.compatibility(tags).is_compatible())
-                {
+                if !no_binary && package.has_eligible_variant_source(install_path, tags)? {
                     database
                         .supported_variant_properties(metadata, require_hashes)
                         .await
@@ -1743,6 +1740,36 @@ impl<'lock> PylockToml {
 }
 
 impl PylockTomlPackage {
+    /// Validate eligible variant sources before running their providers.
+    fn has_eligible_variant_source(
+        &self,
+        install_path: &Path,
+        tags: &Tags,
+    ) -> Result<bool, PylockTomlErrorKind> {
+        let mut has_eligible_variant = false;
+        for wheel in self.wheels.iter().flatten() {
+            let filename = wheel.filename(&self.name)?;
+            if filename.variant().is_some() && filename.compatibility(tags).is_compatible() {
+                wheel.to_registry_wheel(
+                    install_path,
+                    &self.name,
+                    self.version.as_ref(),
+                    self.index.as_ref().map(SafeUrl::as_url),
+                )?;
+                has_eligible_variant = true;
+            }
+        }
+        if let Some(archive) = &self.archive
+            && archive.wheel_filename(&self.name)?.is_some_and(|filename| {
+                filename.variant().is_some() && filename.compatibility(tags).is_compatible()
+            })
+        {
+            archive.to_dist(install_path, &self.name, self.version.as_ref())?;
+            has_eligible_variant = true;
+        }
+        Ok(has_eligible_variant)
+    }
+
     fn record_variant_context(
         &self,
         filename: &WheelFilename,
