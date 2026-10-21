@@ -2,6 +2,8 @@
 //! [installer][`uv_installer`] and [build frontend][`uv_build_frontend`] through [`BuildDispatch`]
 //! implementing [`BuildContext`].
 
+mod variant;
+
 use std::ffi::{OsStr, OsString};
 use std::future::{self, Future};
 use std::path::Path;
@@ -27,7 +29,8 @@ use uv_distribution_filename::DistFilename;
 use uv_distribution_types::{
     CachedDist, ConfigSettings, DependencyMetadata, ExtraBuildRequires, ExtraBuildVariables,
     Identifier, IndexCapabilities, IndexLocations, IsBuildBackendError, Name,
-    PackageConfigSettings, Requirement, Resolution, SourceDist, VersionOrUrlRef,
+    PackageConfigSettings, PluginVariantFeature, Requirement, Resolution, SourceDist,
+    VariantPolicy, VariantProviderOptIn, VersionOrUrlRef,
 };
 use uv_git::GitResolver;
 use uv_installer::{InstallationStrategy, Installer, Plan, Planner, Preparer, SitePackages};
@@ -178,6 +181,7 @@ pub struct BuildDispatch<'a> {
     concurrency: Concurrency,
     preview: Preview,
     tar_backend: TarBackend,
+    variant_policy: Option<&'a VariantPolicy>,
 }
 
 impl<'a> BuildDispatch<'a> {
@@ -237,6 +241,7 @@ impl<'a> BuildDispatch<'a> {
             concurrency,
             preview,
             tar_backend: TarBackend::from_env(),
+            variant_policy: None,
         }
     }
 
@@ -283,6 +288,13 @@ impl<'a> BuildDispatch<'a> {
         self
     }
 
+    /// Set the user policy for wheel variant providers.
+    #[must_use]
+    pub fn with_variant_policy(mut self, policy: &'a VariantPolicy) -> Self {
+        self.variant_policy = Some(policy);
+        self
+    }
+
     fn require_build_hashes(&self) -> bool {
         self.build_hash_checking.is_require()
     }
@@ -302,6 +314,22 @@ impl BuildContext for BuildDispatch<'_> {
 
     fn cache(&self) -> &Cache {
         self.cache
+    }
+
+    fn variant_policy(&self) -> Option<&VariantPolicy> {
+        self.variant_policy
+    }
+
+    async fn query_variant_provider<'data>(
+        &'data self,
+        requires: &'data [String],
+        plugin_api: Option<&'data str>,
+        opt_in: &'data VariantProviderOptIn,
+        require_hashes: bool,
+    ) -> Result<Option<Vec<PluginVariantFeature>>> {
+        variant::query(self, requires, plugin_api, opt_in, require_hashes)
+            .boxed_local()
+            .await
     }
 
     fn git(&self) -> &GitResolver {
@@ -746,6 +774,7 @@ pub struct SharedState {
     in_flight: InFlight,
     /// Build directories for any PEP 517 builds executed during resolution or installation.
     build_arena: BuildArena<SourceBuild>,
+    variant_providers: variant::ProviderCache,
 }
 
 impl SharedState {
@@ -759,6 +788,7 @@ impl SharedState {
             git: self.git.clone(),
             capabilities: self.capabilities.clone(),
             build_arena: self.build_arena.clone(),
+            variant_providers: self.variant_providers.clone(),
             ..Default::default()
         }
     }

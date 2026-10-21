@@ -284,9 +284,6 @@ impl FromStr for VariantProviderOptIn {
 
 /// Whether a plugin endpoint is a dotted Python module with an optional dotted object path.
 pub fn valid_plugin_endpoint(endpoint: &str) -> bool {
-    let (module, object) = endpoint
-        .split_once(':')
-        .map_or((endpoint, None), |(module, object)| (module, Some(object)));
     fn valid_path(path: &str) -> bool {
         path.split('.').all(|part| {
             let mut bytes = part.bytes();
@@ -296,6 +293,9 @@ pub fn valid_plugin_endpoint(endpoint: &str) -> bool {
                 && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         })
     }
+    let (module, object) = endpoint
+        .split_once(':')
+        .map_or((endpoint, None), |(module, object)| (module, Some(object)));
     valid_path(module) && object.is_none_or(valid_path)
 }
 

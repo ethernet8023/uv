@@ -26,7 +26,7 @@ use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
     ArchiveHashPolicy, BuildInfo, BuildableSource, BuiltDist, Dist, DistRef, HashCollection,
     HashValidation, Hashed, IndexUrl, InstalledDist, MetadataHashPolicy, Name, ResolutionRecorder,
-    SourceDist, SourceUrl, parse_url_hashes,
+    SourceDist, SourceUrl, SupportedVariantProperties, VariantsJsonContent, parse_url_hashes,
 };
 use uv_extract::dirhash::{DirectoryDigest, HashedFile};
 use uv_extract::hash::Hasher;
@@ -43,7 +43,7 @@ use uv_threads::initialize_rayon_once;
 use uv_types::{BuildContext, BuildStack};
 
 use crate::archive::Archive;
-use crate::download::check_wheel_variant_compatibility;
+use crate::download::{check_wheel_variant_properties, read_wheel_variant_metadata};
 use crate::error::PythonVersion;
 use crate::extracted_wheel::{ExtractedWheel, HashedWheel, WheelExtractor};
 use crate::hash::http_hash_algorithms;
@@ -73,6 +73,7 @@ pub struct DistributionDatabase<'a, Context: BuildContext> {
     reporter: Option<Arc<dyn Reporter>>,
     content_addressed_cache: bool,
     first_party_packages: Option<&'a FirstPartyPackages>,
+    build_stack: Option<&'a BuildStack>,
 }
 
 impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
@@ -94,6 +95,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             reporter: None,
             content_addressed_cache,
             first_party_packages: None,
+            build_stack: None,
         }
     }
 
@@ -144,8 +146,44 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
     pub fn with_build_stack(self, build_stack: &'a BuildStack) -> Self {
         Self {
             builder: self.builder.with_build_stack(build_stack),
+            build_stack: Some(build_stack),
             ..self
         }
+    }
+
+    /// Whether this database is resolving a wheel variant provider's dependencies.
+    pub fn is_variant_provider(&self) -> bool {
+        self.build_stack
+            .is_some_and(BuildStack::is_variant_provider)
+    }
+
+    /// Obtain compatible properties for a release or wheel.
+    pub async fn supported_variant_properties(
+        &self,
+        metadata: &VariantsJsonContent,
+        require_hashes: bool,
+    ) -> Result<SupportedVariantProperties, Error> {
+        if self.is_variant_provider() {
+            return Ok(SupportedVariantProperties::default());
+        }
+        crate::variant::query_supported_variant_properties(
+            metadata,
+            self.build_context,
+            require_hashes,
+        )
+        .await
+    }
+
+    fn check_provider_dependency(&self, dist: &Dist) -> Result<(), Error> {
+        if self.is_variant_provider()
+            && match dist {
+                Dist::Built(built) => built.wheel_filename().variant().is_some(),
+                Dist::Source(_) => true,
+            }
+        {
+            return Err(Error::VariantProviderDependency(dist.to_string()));
+        }
+        Ok(())
     }
 
     /// Set the [`Reporter`] to use for the [`DistributionDatabase`].
@@ -223,11 +261,26 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         tags: &Tags,
         hashes: ArchiveHashPolicy<'_>,
     ) -> Result<LocalWheel, Error> {
+        self.check_provider_dependency(dist)?;
         match dist {
             Dist::Built(built) => {
                 check_supported_wheel_variant(built)?;
                 let wheel = self.get_wheel(built, hashes).await?;
-                check_wheel_variant_compatibility(&wheel.filename, &wheel.archive)?;
+                if wheel.filename.variant().is_some() {
+                    if hashes.requires_validation() && !hashes.matches(wheel.hashes()) {
+                        return Err(Error::hash_mismatch(
+                            built.to_string(),
+                            hashes.digests(),
+                            wheel.hashes(),
+                        ));
+                    }
+                    if let Some(metadata) =
+                        read_wheel_variant_metadata(&wheel.filename, &wheel.archive)?
+                    {
+                        let supported = self.supported_variant_properties(&metadata, false).await?;
+                        check_wheel_variant_properties(&wheel.filename, &metadata, &supported)?;
+                    }
+                }
                 Ok(wheel)
             }
             // TODO(konsti): Support source distributions that build variant wheels.
@@ -268,6 +321,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         dist: &Dist,
         hashes: MetadataHashPolicy<'_>,
     ) -> Result<ArchiveMetadata, Error> {
+        self.check_provider_dependency(dist)?;
         match dist {
             Dist::Built(built) => self.get_wheel_metadata(built, hashes).await,
             Dist::Source(source) => {

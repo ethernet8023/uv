@@ -9,7 +9,9 @@ use uv_distribution_types::{
 use uv_pep440::Version;
 use uv_pep508::{Requirement, VersionOrUrl};
 use uv_preview::PreviewFeature;
+use uv_types::BuildContext;
 
+use crate::Error;
 use crate::variant::nvidia::NvidiaVariantProvider;
 
 static NVIDIA_PROVIDER: NvidiaVariantProvider = NvidiaVariantProvider::new();
@@ -78,7 +80,7 @@ pub fn supported_variant_properties(metadata: &VariantsJsonContent) -> Supported
         .provider_requests()
         .filter_map(|(namespace, request)| {
             let Some(provider) = find_vendored_provider(namespace, request) else {
-                // TODO(konsti): Support installing and running variant provider plugins.
+                // Synchronous compatibility checks can only use trusted implementations.
                 let provider_name = match request {
                     VariantProviderRequest::Plugin { plugin_api, .. } => plugin_api,
                     VariantProviderRequest::Builtin(name) => Some(name),
@@ -93,6 +95,81 @@ pub fn supported_variant_properties(metadata: &VariantsJsonContent) -> Supported
             Some((namespace, provider.properties()?))
         });
     metadata.supported_properties(detected)
+}
+
+/// Collect compatible properties according to the PEP 850 provider selection algorithm.
+pub(crate) async fn query_supported_variant_properties(
+    metadata: &VariantsJsonContent,
+    context: &impl BuildContext,
+    require_hashes: bool,
+) -> Result<SupportedVariantProperties, Error> {
+    let policy = context.variant_policy();
+    if let Some(target) = policy.and_then(|policy| policy.target()) {
+        return Ok(target.clone());
+    }
+
+    let mut supported = SupportedVariantProperties::default();
+    for (namespace, provider) in metadata.providers() {
+        let enabled = policy.is_some_and(|policy| policy.enables(namespace));
+        if provider.optional() && !enabled {
+            continue;
+        }
+        if let Some(features) = provider.static_properties() {
+            supported.insert(namespace.clone(), &features);
+            continue;
+        }
+        let Some(request) = provider.request() else {
+            continue;
+        };
+        if let Some(provider) = find_vendored_provider(namespace, request) {
+            if let Some(features) = provider.properties() {
+                supported.insert(namespace.clone(), features);
+            }
+            continue;
+        }
+        let VariantProviderRequest::Plugin {
+            requires,
+            plugin_api,
+        } = request
+        else {
+            continue;
+        };
+        let Some(opt_in) = policy.and_then(|policy| policy.opt_in(namespace)) else {
+            debug!("Skipping wheel variant provider for namespace `{namespace}` without opt-in");
+            continue;
+        };
+        if !opt_in.permits_plugin() {
+            continue;
+        }
+        let Some(features) = context
+            .query_variant_provider(requires, plugin_api, opt_in, require_hashes)
+            .await
+            .map_err(|source| Error::VariantProvider {
+                namespace: namespace.clone(),
+                source,
+            })?
+        else {
+            debug!(
+                "Skipping wheel variant provider for namespace `{namespace}` because its identity was not authorized"
+            );
+            continue;
+        };
+        metadata
+            .validate_plugin_features(namespace, &features)
+            .map_err(|source| Error::VariantProvider {
+                namespace: namespace.clone(),
+                source: source.into(),
+            })?;
+        let features = features
+            .into_iter()
+            .map(|feature| SupportedVariantFeature {
+                name: feature.name,
+                values: feature.values,
+            })
+            .collect::<Vec<_>>();
+        supported.insert(namespace.clone(), &features);
+    }
+    Ok(supported)
 }
 
 /// Find a vendored provider that satisfies a plugin request without installing other packages.
@@ -125,12 +202,20 @@ fn find_vendored_provider(
     };
     let default_plugin_api = requirement.name.as_dist_info_name();
     let plugin_api = plugin_api.unwrap_or(default_plugin_api.as_ref());
-    VENDORED_PROVIDERS.iter().copied().find(|provider| {
-        provider.namespace() == namespace.as_str()
-            && provider.package_name() == requirement.name.as_str()
-            && provider.plugin_api().unwrap_or(default_plugin_api.as_ref()) == plugin_api
-            && specifiers
-                .as_ref()
-                .is_none_or(|specifiers| specifiers.contains(&provider.package_version()))
-    })
+    VENDORED_PROVIDERS
+        .iter()
+        .copied()
+        .find(|provider| {
+            provider.package_name() == requirement.name.as_str()
+                && provider.plugin_api().unwrap_or(default_plugin_api.as_ref()) == plugin_api
+                && specifiers
+                    .as_ref()
+                    .is_none_or(|specifiers| specifiers.contains(&provider.package_version()))
+        })
+        .inspect(|provider| {
+            debug!(
+                "Using trusted `{}` provider for variant namespace `{namespace}`",
+                provider.namespace()
+            );
+        })
 }
