@@ -113,6 +113,7 @@ mod requirements;
 mod resolution;
 mod system;
 mod urls;
+mod variant_dependencies;
 
 /// The number of conflicts a package may accumulate before we re-prioritize and backtrack.
 const CONFLICT_THRESHOLD: usize = 5;
@@ -681,6 +682,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     &state.env,
                     &state.python_requirement,
                     &state.pubgrub,
+                    requests,
                 )?;
 
                 match forked_deps {
@@ -1942,6 +1944,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         env: &ResolverEnvironment,
         python_requirement: &PythonRequirement,
         pubgrub: &State<UvDependencyProvider>,
+        requests: &MetadataRequests,
     ) -> Result<ForkedDependencies, ResolveError> {
         let dependencies = self.get_dependencies(
             id,
@@ -1952,6 +1955,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             env,
             python_requirement,
             pubgrub,
+            requests,
         )?;
         if env.marker_environment().is_some() {
             Ok(ForkedDependencies::from_dependencies_platform_specific(
@@ -1979,6 +1983,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         env: &ResolverEnvironment,
         python_requirement: &PythonRequirement,
         pubgrub: &State<UvDependencyProvider>,
+        requests: &MetadataRequests,
     ) -> Result<Dependencies, ResolveError> {
         let expander =
             RequirementExpander::new(&self.constraints, &self.modifiers, env, python_requirement);
@@ -1999,14 +2004,20 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 kind,
                 marker: _,
             } => {
-                if uv_preview::is_enabled(PreviewFeature::WheelVariants)
-                    && let Some(variants_json) = pins.variants_json(name, version)
-                    && let Err(reason) = &*variants_json.wait()
+                let variants = if uv_preview::is_enabled(PreviewFeature::WheelVariants)
+                    && let Some(registered) = pins.variants_json(name, version)
                 {
-                    return Ok(Dependencies::Unavailable(
-                        self.record_unavailable_metadata(name, version, reason),
-                    ));
-                }
+                    match registered.wait().as_ref() {
+                        Ok(parsed) => Some(Arc::clone(parsed)),
+                        Err(reason) => {
+                            return Ok(Dependencies::Unavailable(
+                                self.record_unavailable_metadata(name, version, reason),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 // If we're excluding transitive dependencies, short-circuit.
                 if self.dependency_mode.is_direct() {
@@ -2031,6 +2042,17 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
 
                 // Wait for the metadata to be available.
                 let response = registered.wait();
+                let response = if env.marker_environment().is_none()
+                    && let Some(variants) = variants
+                    && let MetadataResponse::Found(baseline) = response.as_ref()
+                    && let Some(ResolvedDist::Installable { dist, .. }) = pins.get(name, version)
+                {
+                    requests
+                        .request_variant_dependencies(Arc::clone(dist), variants, baseline)?
+                        .wait_blocking()
+                } else {
+                    response
+                };
 
                 let metadata = match &*response {
                     MetadataResponse::Found(archive) => &archive.metadata,
@@ -2310,6 +2332,11 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                         .direct_variants()
                         .done(dist.distribution_id(), variant);
                 }
+                Some(Response::VariantDependencies { dist, metadata }) => {
+                    self.index
+                        .variant_dependencies()
+                        .done(dist, Arc::new(metadata));
+                }
                 None => {}
             }
         }
@@ -2327,6 +2354,15 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             Request::DirectVariant(dist) => {
                 let variant = provider.select_wheel_variant(&dist).await.map_err(Arc::new);
                 Ok(Some(Response::DirectVariant { dist, variant }))
+            }
+            Request::VariantDependencies {
+                dist,
+                variants,
+                baseline,
+            } => {
+                let metadata =
+                    variant_dependencies::combine(provider, &dist, &variants, *baseline).await?;
+                Ok(Some(Response::VariantDependencies { dist, metadata }))
             }
             Request::VariantProperties(parsed) => {
                 let require_hashes = self
@@ -3578,6 +3614,12 @@ pub(crate) enum Request {
     VariantProperties(Arc<ParsedVariantsJson>),
     /// A request to select the supported properties of a direct wheel.
     DirectVariant(BuiltDist),
+    /// Combine dependencies from the ordinary wheels and variants declared by this sidecar.
+    VariantDependencies {
+        dist: Arc<Dist>,
+        variants: Arc<ParsedVariantsJson>,
+        baseline: Box<ArchiveMetadata>,
+    },
     /// A request to pre-fetch the metadata for a package and the best-guess distribution.
     Prefetch(PackageName, Range<Version>, PythonRequirement),
 }
@@ -3638,6 +3680,9 @@ impl Display for Request {
                 write!(f, "Variant properties `{}`", parsed.artifact.filename)
             }
             Self::DirectVariant(dist) => write!(f, "Direct wheel variant `{dist}`"),
+            Self::VariantDependencies { dist, .. } => {
+                write!(f, "Variant wheel dependencies `{dist}`")
+            }
             Self::Prefetch(package_name, range, _) => {
                 write!(f, "Prefetch {package_name} {range}")
             }
@@ -3674,6 +3719,11 @@ enum Response {
     DirectVariant {
         dist: BuiltDist,
         variant: Result<Option<SelectedVariant>, Arc<uv_distribution::Error>>,
+    },
+    /// Dependency metadata combined across a release's variant wheels.
+    VariantDependencies {
+        dist: Arc<Dist>,
+        metadata: MetadataResponse,
     },
 }
 

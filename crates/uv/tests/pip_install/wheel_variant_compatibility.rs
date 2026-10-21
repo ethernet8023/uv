@@ -189,6 +189,64 @@ fn selected_variant_properties_filter_dependencies() -> Result<()> {
     Ok(())
 }
 
+/// A universal lock must retain each variant wheel's own dependencies, even when its metadata
+/// does not put an explicit variant marker on them.
+#[test]
+fn lock_variant_wheel_specific_dependencies() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "variant-wheel-specific-dependencies"
+        root = {}
+        expected.satisfiable = true
+
+        [packages.ok.versions."1.0.0"]
+        wheel = false
+        sdist = false
+        variants.namespaces = ["blas_lapack"]
+        variants.providers.blas_lapack.static-properties.library = ["openblas"]
+        variants.wheels.null.properties = []
+        variants.wheels.null.requires = ["cpu-only==1.0.0"]
+        variants.wheels.openblas.properties = ["blas_lapack :: library :: openblas"]
+        variants.wheels.openblas.requires = ["blas-only==1.0.0"]
+
+        [packages.cpu-only.versions."1.0.0"]
+        [packages.blas-only.versions."1.0.0"]
+    "#})?;
+    let server = PackseServer::from_scenario(&scenario);
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "project"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["ok==1.0.0"]
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock()
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("--index-url")
+        .arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    ");
+    uv_snapshot!(context.filters(), context.sync()
+        .arg("--frozen")
+        .arg("--preview-features")
+        .arg("wheel-variants"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + blas-only==1.0.0
+     + ok==1.0.0
+    ");
+    Ok(())
+}
+
 /// Local wheels must remain compatible when installed or cached.
 #[test]
 fn install_local_variant_wheel() -> Result<()> {
