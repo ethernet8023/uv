@@ -42,6 +42,13 @@ pub enum VariantsJsonParseError {
 pub type VariantProperties =
     BTreeMap<VariantNamespace, BTreeMap<VariantFeature, Vec<VariantValue>>>;
 
+/// The variant properties used to resolve a wheel's dependencies for an installation target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedVariant {
+    pub label: VariantLabel,
+    pub properties: VariantProperties,
+}
+
 /// Required variant properties unsupported by the target system.
 #[derive(Debug)]
 pub struct UnsupportedVariantProperties(VariantProperties);
@@ -122,12 +129,17 @@ pub struct VariantsJsonContent {
 }
 
 impl VariantsJsonContent {
+    /// The label when this metadata describes exactly one wheel variant.
+    pub fn wheel_label(&self) -> Option<&VariantLabel> {
+        self.variants.keys().exactly_one().ok()
+    }
+
     /// The variant label, if this describes a single compatible wheel variant.
     pub fn compatible_wheel_label(
         &self,
         supported_properties: &SupportedVariantProperties,
     ) -> Option<&VariantLabel> {
-        let label = self.variants.keys().exactly_one().ok()?;
+        let label = self.wheel_label()?;
         self.score_variant(label, supported_properties)?;
         Some(label)
     }
@@ -182,6 +194,59 @@ impl VariantsJsonContent {
             properties: properties.into_iter().map(Reverse).collect(),
             label: Reverse(label.clone()),
         })
+    }
+
+    /// Return the wheel properties supported by the installation target.
+    pub fn select_variant(
+        &self,
+        label: &VariantLabel,
+        supported: &SupportedVariantProperties,
+    ) -> Option<SelectedVariant> {
+        self.score_variant(label, supported)?;
+        let mut properties = BTreeMap::new();
+        for (namespace, features) in self.variants.get(label)? {
+            let supported_features = supported.properties.get(namespace)?;
+            let mut selected_features = BTreeMap::new();
+            for (feature, values) in features {
+                let (_, supported_values) = supported_features
+                    .iter()
+                    .find(|(supported_feature, _)| supported_feature == feature)?;
+                let selected_values = values
+                    .iter()
+                    .filter(|value| supported_values.contains(value))
+                    .cloned()
+                    .collect();
+                selected_features.insert(feature.clone(), selected_values);
+            }
+            properties.insert(namespace.clone(), selected_features);
+        }
+        Some(SelectedVariant {
+            label: label.clone(),
+            properties,
+        })
+    }
+
+    /// Verify that selected properties describe a complete supported subset of this wheel.
+    pub fn validates_selected_variant(&self, selected: &SelectedVariant) -> bool {
+        if self.wheel_label() != Some(&selected.label) {
+            return false;
+        }
+        let supported = SupportedVariantProperties {
+            properties: selected
+                .properties
+                .iter()
+                .map(|(namespace, features)| {
+                    (
+                        namespace.clone(),
+                        features
+                            .iter()
+                            .map(|(feature, values)| (feature.clone(), values.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        };
+        self.select_variant(&selected.label, &supported).as_ref() == Some(selected)
     }
 
     /// Return the unsupported properties for a variant present in this metadata, if any.
