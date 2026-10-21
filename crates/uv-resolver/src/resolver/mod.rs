@@ -160,6 +160,8 @@ struct ResolverState<InstalledPackages: InstalledPackagesProvider> {
     reporter: Option<Arc<dyn Reporter>>,
     /// Provider environments cannot recursively install variant wheels.
     is_variant_provider: bool,
+    /// The explicit target used to recheck installed wheel variants.
+    variant_target: Option<SupportedVariantProperties>,
 }
 
 /// The result of checking a candidate version's wheel variants.
@@ -291,6 +293,7 @@ impl<Provider: ResolverProvider, InstalledPackages: InstalledPackagesProvider>
             options,
             reporter: None,
             is_variant_provider: provider.is_variant_provider(),
+            variant_target: provider.variant_target().cloned(),
         };
         Self { state, provider }
     }
@@ -1356,7 +1359,8 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         let candidate = if specific_environment
             && let CandidateDist::Compatible(CompatibleDist::InstalledDist(installed)) =
                 candidate.dist()
-            && !InstalledWheelVariant::check(installed).is_compatible()
+            && !InstalledWheelVariant::check_with_target(installed, self.variant_target.as_ref())
+                .is_compatible()
         {
             let Some(alternative) = self.selector.select_no_preference(
                 name,

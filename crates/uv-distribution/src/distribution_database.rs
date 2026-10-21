@@ -157,6 +157,13 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             .is_some_and(BuildStack::is_variant_provider)
     }
 
+    /// Return the explicitly configured variant target, if any.
+    pub fn variant_target(&self) -> Option<&SupportedVariantProperties> {
+        self.build_context
+            .variant_policy()
+            .and_then(|policy| policy.target())
+    }
+
     /// Obtain compatible properties for a release or wheel.
     pub async fn supported_variant_properties(
         &self,

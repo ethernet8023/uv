@@ -94,6 +94,11 @@ pub trait ResolverProvider {
         false
     }
 
+    /// Return an explicitly configured variant target, if any.
+    fn variant_target(&self) -> Option<&SupportedVariantProperties> {
+        None
+    }
+
     /// Set the [`Reporter`] to use for this installer.
     #[must_use]
     fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self;
@@ -199,6 +204,10 @@ impl<'a, Context: BuildContext> DefaultResolverProvider<'a, Context> {
 impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Context> {
     fn is_variant_provider(&self) -> bool {
         self.fetcher.is_variant_provider()
+    }
+
+    fn variant_target(&self) -> Option<&SupportedVariantProperties> {
+        self.fetcher.variant_target()
     }
 
     async fn supported_variant_properties<'io>(
