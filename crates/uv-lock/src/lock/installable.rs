@@ -95,6 +95,51 @@ fn package_dependencies<'a>(
     }
 }
 
+fn push_possible_dependency<'lock>(
+    queue: &mut Vec<(PackageIndex, Option<&'lock ExtraName>)>,
+    dependency: &'lock Dependency,
+    marker_env: &ResolverMarkerEnvironment,
+) {
+    if !dependency
+        .complexified_marker
+        .pep508()
+        .evaluate(marker_env, &[])
+    {
+        return;
+    }
+    queue.push((dependency.index, None));
+    queue.extend(
+        dependency
+            .extra
+            .iter()
+            .map(|extra| (dependency.index, Some(extra))),
+    );
+}
+
+/// Find extras that could be activated from the selected roots. The environment is fixed, while
+/// conflict items and variant selections may change during the traversal.
+fn potentially_activated_extras<'lock>(
+    lock: &'lock Lock,
+    mut queue: Vec<(PackageIndex, Option<&'lock ExtraName>)>,
+    marker_env: &ResolverMarkerEnvironment,
+) -> FxHashSet<(&'lock PackageName, &'lock ExtraName)> {
+    let mut seen = FxHashSet::default();
+    let mut extras = FxHashSet::default();
+    while let Some((index, extra)) = queue.pop() {
+        if !seen.insert((index, extra)) {
+            continue;
+        }
+        let package = lock.package(index);
+        if let Some(extra) = extra {
+            extras.insert((package.name(), extra));
+        }
+        for dependency in package_dependencies(package, extra) {
+            push_possible_dependency(&mut queue, dependency, marker_env);
+        }
+    }
+    extras
+}
+
 /// Determines which dependencies are included from an install target root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallableRootKind {
@@ -252,7 +297,7 @@ pub trait Installable<'lock> {
                 });
                 return Ok(resolution.with_variant_contexts(contexts));
             }
-            if !pending.values().any(|(_, stable)| *stable) {
+            if !pending.values().any(|selection| selection.stable) {
                 let index = pending.keys().min_by_key(|index| index.0).copied();
                 if let Some(index) = index {
                     return Err(LockErrorKind::VariantConflictReachability {
@@ -261,7 +306,7 @@ pub trait Installable<'lock> {
                     .into());
                 }
             }
-            for (index, (install, stable)) in pending {
+            for (index, PendingVariantSelection { install, stable }) in pending {
                 if !stable {
                     continue;
                 }
@@ -1050,19 +1095,38 @@ trait InstallableExt<'lock>: Installable<'lock> {
             }
         }
 
+        let is_active = |item: &ConflictItem| match item.kind() {
+            ConflictKind::Project => activated_projects.contains(&item.package()),
+            ConflictKind::Extra(extra) => activated_extras.contains(&(item.package(), extra)),
+            ConflictKind::Group(group) => activated_groups.contains(&(item.package(), group)),
+        };
         if !unresolved.is_empty() {
             let potentially_activated_extras = if has_conflicts {
-                self.lock()
-                    .packages()
-                    .iter()
-                    .flat_map(Package::all_dependencies)
-                    .flat_map(|dependency| {
-                        dependency
-                            .extra
-                            .iter()
-                            .map(|extra| (&dependency.package_id.name, extra))
-                    })
-                    .collect::<FxHashSet<_>>()
+                let mut possible_roots = conflict_reachability.keys().copied().collect::<Vec<_>>();
+                if groups.prod() {
+                    for root in roots {
+                        let index = self.lock().by_id[&root.id];
+                        possible_roots.extend(
+                            extras
+                                .extra_names(root.optional_dependencies.keys())
+                                .map(|extra| (index, Some(extra))),
+                        );
+                    }
+                }
+                for root in roots.iter().copied().chain(group_root) {
+                    for (group, dependencies) in &root.dependency_groups {
+                        if self.includes_group(Some(root.name()), group, groups) {
+                            for dependency in dependencies {
+                                push_possible_dependency(
+                                    &mut possible_roots,
+                                    dependency,
+                                    marker_env,
+                                );
+                            }
+                        }
+                    }
+                }
+                potentially_activated_extras(self.lock(), possible_roots, marker_env)
             } else {
                 FxHashSet::default()
             };
@@ -1087,15 +1151,6 @@ trait InstallableExt<'lock>: Installable<'lock> {
                 let stable = if has_conflicts {
                     let mut stable_reachability = reachability;
                     for set in self.lock().conflicts().iter() {
-                        let is_active = |item: &ConflictItem| match item.kind() {
-                            ConflictKind::Project => activated_projects.contains(&item.package()),
-                            ConflictKind::Extra(extra) => {
-                                activated_extras.contains(&(item.package(), extra))
-                            }
-                            ConflictKind::Group(group) => {
-                                activated_groups.contains(&(item.package(), group))
-                            }
-                        };
                         let set_active = set.iter().any(is_active);
                         for item in set.iter() {
                             if is_active(item) {
@@ -1147,16 +1202,7 @@ trait InstallableExt<'lock>: Installable<'lock> {
                         continue;
                     }
 
-                    let active = match item.kind() {
-                        ConflictKind::Project => activated_projects.contains(&item.package()),
-                        ConflictKind::Extra(extra) => {
-                            activated_extras.contains(&(item.package(), extra))
-                        }
-                        ConflictKind::Group(group) => {
-                            activated_groups.contains(&(item.package(), group))
-                        }
-                    };
-                    if active {
+                    if is_active(item) {
                         marker.assume_conflict_item(item);
                     } else {
                         marker.assume_not_conflict_item(item);
@@ -1348,8 +1394,18 @@ struct VariantInstallable<'a, T: ?Sized> {
     target: &'a T,
     selected: FxHashMap<PackageIndex, Node>,
     variants: FxHashMap<String, SelectedVariant>,
+    /// Packages encountered before the traversal has resolved their conflict markers.
     requested: RefCell<FxHashMap<PackageIndex, bool>>,
-    pending: RefCell<FxHashMap<PackageIndex, (bool, bool)>>,
+    /// Requested packages that are still reachable after evaluating those markers.
+    pending: RefCell<FxHashMap<PackageIndex, PendingVariantSelection>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PendingVariantSelection {
+    /// At least one reachable path requires the distribution to be installed.
+    install: bool,
+    /// At least one path stays reachable regardless of extras that later selections activate.
+    stable: bool,
 }
 
 impl<'lock, T: Installable<'lock> + ?Sized> VariantInstallable<'_, T> {
@@ -1373,6 +1429,8 @@ impl<'lock, T: Installable<'lock> + ?Sized> VariantInstallable<'_, T> {
             .entry(index)
             .and_modify(|requested_install| *requested_install |= install)
             .or_insert(install);
+        // Record the package without selecting it. Once the traversal knows which paths remain
+        // reachable, it queues their selections and replaces this placeholder on its next pass.
         Node::Root
     }
 }
@@ -1460,11 +1518,11 @@ impl<'lock, T: Installable<'lock> + ?Sized> Installable<'lock> for VariantInstal
             self.pending
                 .borrow_mut()
                 .entry(index)
-                .and_modify(|(pending_install, pending_stable)| {
-                    *pending_install |= install;
-                    *pending_stable |= stable;
+                .and_modify(|selection| {
+                    selection.install |= install;
+                    selection.stable |= stable;
                 })
-                .or_insert((install, stable));
+                .or_insert(PendingVariantSelection { install, stable });
         }
     }
 
@@ -2301,6 +2359,103 @@ provides-extras = ["cli"]
         )
         "#);
         });
+    }
+
+    /// An unselected extra and a dependency for another platform can contain activators for a
+    /// conflicting extra. Their presence must not make a reachable variant branch appear unstable.
+    #[test]
+    fn schedules_only_reachable_variants_with_unselected_activators() {
+        let lock = Lock::from_toml(
+            r#"
+version = 1
+revision = 3
+requires-python = ">=3.11"
+conflicts = [[
+    { package = "project", extra = "cpu" },
+    { package = "project", extra = "gpu" },
+]]
+
+[[package]]
+name = "excluded"
+version = "1.0.0"
+source = { registry = "https://example.com/simple" }
+[[package.wheels]]
+url = "https://example.com/excluded-1.0.0-py3-none-any-null.whl"
+hash = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+[[package]]
+name = "platform-excluded"
+version = "1.0.0"
+source = { virtual = "platform-excluded" }
+dependencies = [{ name = "project", extra = ["gpu"] }]
+
+[[package]]
+name = "project"
+version = "1.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "excluded", marker = "extra == 'extra-7-project-gpu'" },
+    { name = "platform-excluded", marker = "sys_platform == 'linux'" },
+    { name = "selected", marker = "extra != 'extra-7-project-gpu'" },
+]
+
+[package.optional-dependencies]
+cpu = []
+gpu = []
+unselected = [{ name = "project", extra = ["gpu"] }]
+
+[package.metadata]
+provides-extras = ["cpu", "gpu", "unselected"]
+
+[[package]]
+name = "selected"
+version = "1.0.0"
+source = { registry = "https://example.com/simple" }
+[[package.wheels]]
+url = "https://example.com/selected-1.0.0-py3-none-any-null.whl"
+hash = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+"#,
+        )
+        .expect("valid lock");
+        let root = package(&lock, "project", "1.0.0");
+        let target = LockedPackages {
+            lock: &lock,
+            install_path: Path::new(env!("CARGO_MANIFEST_DIR")),
+            project_name: Some(root.name()),
+        };
+        let target = VariantInstallable {
+            target: &target,
+            selected: FxHashMap::default(),
+            variants: FxHashMap::default(),
+            requested: RefCell::default(),
+            pending: RefCell::default(),
+        };
+        let extras = ExtrasSpecification::default().with_defaults(DefaultExtras::default());
+        target
+            .to_resolution_from_packages(
+                &[root],
+                None,
+                true,
+                DependencySelectionContext::None,
+                &DARWIN_MARKERS,
+                &TAGS,
+                &extras,
+                &DependencyGroupsWithDefaults::none(),
+                &BuildOptions::default(),
+                &InstallOptions::default(),
+            )
+            .expect("valid resolution");
+
+        let pending = target.pending.take();
+        let selected = package(&lock, "selected", "1.0.0");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.get(&lock.by_id[&selected.id]),
+            Some(&PendingVariantSelection {
+                install: true,
+                stable: true,
+            })
+        );
     }
 
     #[test]
