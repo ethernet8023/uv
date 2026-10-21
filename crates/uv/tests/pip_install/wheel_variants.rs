@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use uv_distribution_types::{PEP_825_SCHEMA, PEP_850_SCHEMA};
 use uv_static::EnvVars;
 use uv_test::archive::generate_source_archive;
-use uv_test::packse::{PackseServer, scenario::Scenario};
+use uv_test::packse::{PackseServer, WheelBuilder, scenario::Scenario};
 use uv_test::uv_snapshot;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -992,7 +992,7 @@ fn sdist_metadata_ignores_variant_wheels() -> Result<()> {
 }
 
 #[test]
-fn universal_lock_excludes_variant_wheels() -> Result<()> {
+fn universal_lock_preserves_variant_wheels() -> Result<()> {
     let context = uv_test::test_context!("3.12");
     let links = context.temp_dir.child("links");
     links.create_dir_all()?;
@@ -1002,12 +1002,25 @@ fn universal_lock_excludes_variant_wheels() -> Result<()> {
             .join("test/links/ok-1.0.0-py3-none-any.whl"),
         links.child("ok-1.0.0-py3-none-any.whl"),
     )?;
+    let metadata = json!({
+        "$schema": PEP_825_SCHEMA,
+        "default-priorities": { "namespace": ["x86_64"] },
+        "variants": { "null": {} },
+    })
+    .to_string();
+    let context = context.with_filter((
+        hex::encode(Sha256::digest(metadata.as_bytes())),
+        "[SIDECAR_HASH]",
+    ));
+    let name = "ok".parse()?;
+    let version = "1.0.0".parse()?;
+    let (_, wheel) = WheelBuilder::new(&name, &version)
+        .files(&[("ok-1.0.0.dist-info/variant.json", &metadata)])
+        .build();
     links
-        .child("ok-1.0.0-9-py3-none-any-cpu.whl")
-        .write_str("invalid wheel")?;
-    links
-        .child("ok-2.0.0-py3-none-any-null.whl")
-        .write_str("invalid wheel")?;
+        .child("ok-1.0.0-py3-none-any-null.whl")
+        .write_binary(&wheel)?;
+    links.child("ok-1.0.0-variants.json").write_str(&metadata)?;
     context
         .temp_dir
         .child("pyproject.toml")
@@ -1058,26 +1071,14 @@ fn universal_lock_excludes_variant_wheels() -> Result<()> {
         name = "ok"
         version = "1.0.0"
         source = { registry = "[TEMP_DIR]/links" }
+        variants-json = { path = "[TEMP_DIR]/links/ok-1.0.0-variants.json", hash = "sha256:[SIDECAR_HASH]" }
         wheels = [
             { path = "[TEMP_DIR]/links/ok-1.0.0-py3-none-any.whl" },
+            { path = "[TEMP_DIR]/links/ok-1.0.0-py3-none-any-null.whl" },
         ]
         "#);
     });
 
-    // A lockfile containing a variant wheel must not make it installable.
-    let lock = context.read("uv.lock").replace(
-        "ok-1.0.0-py3-none-any.whl",
-        "ok-1.0.0-9-py3-none-any-cpu.whl",
-    );
-    context.temp_dir.child("uv.lock").write_str(&lock)?;
-    uv_snapshot!(context.filters(), context.sync()
-        .arg("--frozen")
-        .arg("--preview-features")
-        .arg("wheel-variants"), @"
-    exit_code: 2 (failure)
-    ----- stderr -----
-    error: Distribution `ok==1.0.0 @ registry+[TEMP_DIR]/links` can't be installed because it doesn't have a source distribution or wheel for the current platform
-    ");
     Ok(())
 }
 
@@ -1134,5 +1135,64 @@ async fn registry_variant_wheels_are_not_selectable() -> Result<()> {
     ----- stdout -----
     []
     ");
+    Ok(())
+}
+
+/// A conflicting extra makes the variant branch unreachable, while selecting that branch requires
+/// the sidecar bytes to match the lockfile.
+#[test]
+fn frozen_sync_authenticates_reachable_variant_metadata() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let links = context.temp_dir.child("links");
+    links.create_dir_all()?;
+    let metadata = json!({
+        "$schema": PEP_825_SCHEMA,
+        "default-priorities": { "namespace": ["x86_64"] },
+        "variants": { "null": {} },
+    })
+    .to_string();
+    let name = "ok".parse()?;
+    let version = "1.0.0".parse()?;
+    let (_, wheel) = WheelBuilder::new(&name, &version)
+        .files(&[("ok-1.0.0.dist-info/variant.json", &metadata)])
+        .build();
+    links
+        .child("ok-1.0.0-py3-none-any-null.whl")
+        .write_binary(&wheel)?;
+    let cpu_version = "2.0.0".parse()?;
+    let (_, cpu_wheel) = WheelBuilder::new(&name, &cpu_version).build();
+    links
+        .child("ok-2.0.0-py3-none-any.whl")
+        .write_binary(&cpu_wheel)?;
+    let sidecar = links.child("ok-1.0.0-variants.json");
+    sidecar.write_str(&metadata)?;
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "example"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        cpu = ["ok==2.0.0"]
+        gpu = ["ok==1.0.0"]
+
+        [tool.uv]
+        conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+        no-index = true
+        find-links = ["links"]
+        preview-features = ["wheel-variants"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.lock(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+    sidecar.write_str("tampered")?;
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("cpu"), @"");
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("gpu"), @"");
     Ok(())
 }
