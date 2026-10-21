@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use tracing::{Level, trace};
 
-use uv_distribution_types::{Dist, DistributionId, Identifier, IndexUrl, ResolvedDist};
+use uv_distribution_types::{
+    Dist, DistributionId, Identifier, IndexUrl, RegistryVariantsJson, ResolvedDist,
+};
 use uv_git::GitResolver;
 use uv_normalize::PackageName;
 use uv_pep440::{MIN_VERSION, Version};
@@ -56,6 +58,7 @@ enum SelectedSource {
         metadata_id: DistributionId,
         /// Direct-only resolution need not fetch registry metadata.
         metadata: Option<Arc<MetadataResponse>>,
+        variants_json: Option<RegistryVariantsJson>,
     },
 }
 
@@ -102,6 +105,10 @@ impl SelectedDistribution {
                 dist: dist.clone(),
                 metadata_id: metadata_id.clone(),
                 metadata,
+                variants_json: pins
+                    .variants_json(&package.name, &version)
+                    .and_then(|registered| registered.wait().as_ref().as_ref().ok().cloned())
+                    .map(|parsed| parsed.artifact.clone()),
             }
         };
         Ok(Self { version, source })
@@ -112,10 +119,24 @@ impl SelectedDistribution {
     }
 
     /// Move the selected artifact and metadata into the output graph.
-    pub(crate) fn into_parts(self) -> (Version, ResolvedDist, Option<Arc<MetadataResponse>>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Version,
+        ResolvedDist,
+        Option<Arc<MetadataResponse>>,
+        Option<RegistryVariantsJson>,
+    ) {
         match self.source {
-            SelectedSource::Url { dist, metadata, .. } => (self.version, dist, Some(metadata)),
-            SelectedSource::Registry { dist, metadata, .. } => (self.version, dist, metadata),
+            SelectedSource::Url { dist, metadata, .. } => {
+                (self.version, dist, Some(metadata), None)
+            }
+            SelectedSource::Registry {
+                dist,
+                metadata,
+                variants_json,
+                ..
+            } => (self.version, dist, metadata, variants_json),
         }
     }
 

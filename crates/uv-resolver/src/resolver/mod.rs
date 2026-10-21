@@ -24,8 +24,9 @@ use uv_configuration::{Constraints, DependencyModifiers, IndexStrategy};
 use uv_distribution::{ArchiveMetadata, DistributionDatabase, InstalledWheelVariant};
 use uv_distribution_types::{
     BuiltDist, DerivationChain, Dist, DistErrorKind, Identifier, IndexCapabilities, IndexLocations,
-    IndexMetadata, IndexUrl, InstalledDist, Name, RemoteSource, Requirement, RequiresPython,
-    ResolutionRecorder, ResolvedDist, SourceDist, VariantsJsonContent, VersionOrUrlRef,
+    IndexMetadata, IndexUrl, InstalledDist, Name, RegistryVariantsJson, RemoteSource, Requirement,
+    RequiresPython, ResolutionRecorder, ResolvedDist, SourceDist, VariantsJsonContent,
+    VersionOrUrlRef,
 };
 use uv_git::GitResolver;
 use uv_normalize::PackageName;
@@ -52,7 +53,7 @@ use crate::pins::FilePins;
 use crate::preferences::{PreferenceSource, Preferences};
 use crate::prioritized_distribution::{
     CompatibleDist, IncompatibleDist, IncompatibleSource, IncompatibleWheel, PrioritizedDist,
-    PythonRequirementKind, RegistryVariantsJson, implied_markers,
+    PythonRequirementKind, implied_markers,
 };
 use crate::pubgrub::{
     DependencySource, PubGrubDependency, PubGrubPackage, PubGrubPackageInner, PubGrubPriorities,
@@ -74,7 +75,7 @@ use crate::resolver::environment::{
 };
 pub(crate) use crate::resolver::fork_map::{ForkMap, ForkSet};
 pub use crate::resolver::index::InMemoryIndex;
-use crate::resolver::index::ParsedVariantsJsonResponse;
+use crate::resolver::index::{ParsedVariantsJson, ParsedVariantsJsonResponse};
 use crate::resolver::indexes::Indexes;
 use crate::resolver::package_source::PackageSource;
 pub use crate::resolver::provider::{
@@ -1247,15 +1248,8 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 }
             }
 
-            let incompatible_tag =
-                if filename.variant().is_some() && env.marker_environment().is_none() {
-                    // Universal lockfiles cannot yet record wheel variants.
-                    Some(IncompatibleTag::Variant)
-                } else if !python_requirement.target().matches_wheel_tag(filename) {
-                    Some(IncompatibleTag::AbiPythonVersion)
-                } else {
-                    None
-                };
+            let incompatible_tag = (!python_requirement.target().matches_wheel_tag(filename))
+                .then_some(IncompatibleTag::AbiPythonVersion);
             if let Some(tag) = incompatible_tag {
                 return Ok(Some(ResolverVersion::Unavailable(
                     filename.version.clone(),
@@ -1349,7 +1343,6 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             return Ok(None);
         };
 
-        // Universal lockfiles cannot yet record the metadata needed to select a variant.
         let specific_environment = env.marker_environment().is_some();
         let preview_variants =
             specific_environment && uv_preview::is_enabled(PreviewFeature::WheelVariants);
@@ -1548,7 +1541,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             let mut metadata = Vec::with_capacity(responses.len());
             for (index, response) in &responses {
                 match response.as_ref() {
-                    Ok(content) => metadata.push((*index, content)),
+                    Ok(parsed) => metadata.push((*index, &parsed.content)),
                     Err(reason) => {
                         // Keep the first error to report if no distribution works.
                         selection.unavailable.get_or_insert_with(|| reason.clone());
@@ -1810,12 +1803,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         };
         let variants_json = if uv_preview::is_enabled(PreviewFeature::WheelVariants)
             && let Some(index) = index
-            && let Some(variants_json) = candidate.prioritized().and_then(|prioritized| {
-                prioritized
-                    .variants_json()
-                    .iter()
-                    .find(|variants_json| &variants_json.index == index)
-            }) {
+            && let Some(variants_json) = candidate
+                .prioritized()
+                .and_then(|prioritized| prioritized.variants_json_for_index(index))
+        {
             Some(requests.request_variants_json(variants_json)?)
         } else {
             None
@@ -2248,15 +2239,21 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     .await
                     .map_err(ResolveError::Client)?;
                 let response = match response {
-                    VariantsJsonResponse::Found(contents) => {
-                        VariantsJsonContent::from_slice(&contents).map_err(|source| {
-                            MetadataUnavailable::InvalidVariantMetadata(Arc::new(
-                                VariantsJsonMetadataError {
-                                    filename: variants_json.filename.clone(),
-                                    source,
-                                },
-                            ))
-                        })
+                    VariantsJsonResponse::Found(fetched) => {
+                        VariantsJsonContent::from_slice(&fetched.contents)
+                            .map(|content| {
+                                let mut artifact = variants_json.clone();
+                                artifact.file.hashes = fetched.hash.into();
+                                Arc::new(ParsedVariantsJson { content, artifact })
+                            })
+                            .map_err(|source| {
+                                MetadataUnavailable::InvalidVariantMetadata(Arc::new(
+                                    VariantsJsonMetadataError {
+                                        filename: variants_json.filename.clone(),
+                                        source,
+                                    },
+                                ))
+                            })
                     }
                     VariantsJsonResponse::Unavailable(reason) => Err(reason),
                 };

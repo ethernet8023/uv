@@ -3,7 +3,7 @@ use std::sync::Arc;
 pub use uv_resolver_types::MetadataResponse;
 pub(crate) use uv_resolver_types::MetadataUnavailable;
 
-use uv_client::MetadataFormat;
+use uv_client::{FetchedVariantsJson, MetadataFormat};
 use uv_configuration::BuildOptions;
 use uv_distribution::{DistributionDatabase, Reporter};
 use uv_distribution_types::{
@@ -31,7 +31,7 @@ pub type WheelMetadataResult = Result<MetadataResponse, uv_distribution::Error>;
 #[derive(Debug)]
 pub enum VariantsJsonResponse {
     /// The variant metadata was fetched successfully.
-    Found(Vec<u8>),
+    Found(FetchedVariantsJson),
     /// The package version cannot be used.
     Unavailable(MetadataUnavailable),
 }
@@ -356,7 +356,7 @@ impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Con
             .managed(|client| client.fetch_variants_json(package_name, file, index))
             .await
         {
-            Ok(fetched) => Ok(VariantsJsonResponse::Found(fetched.contents)),
+            Ok(contents) => Ok(VariantsJsonResponse::Found(contents)),
             Err(error) => match self.classify_metadata_error(error, Some(index)) {
                 Ok(reason) => Ok(VariantsJsonResponse::Unavailable(reason)),
                 Err(error) => Err(error),

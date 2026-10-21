@@ -8,7 +8,7 @@ use uv_distribution::supported_variant_properties;
 use uv_distribution_filename::{BuildTag, WheelFilename};
 use uv_distribution_types::{
     File, IndexUrl, InstalledDist, MinimumLibcVersion, Name, RegistryBuiltDist, RegistryBuiltWheel,
-    RegistrySourceDist, RequiresPython, VariantsJsonContent, VariantsJsonFilename,
+    RegistrySourceDist, RegistryVariantsJson, RequiresPython, VariantsJsonContent,
 };
 use uv_normalize::PackageName;
 use uv_pep440::{Version, VersionSpecifier, VersionSpecifiers};
@@ -24,14 +24,6 @@ use crate::resolved::ResolvedDistRef;
 /// A collection of distributions that have been filtered by relevance.
 #[derive(Debug, Default, Clone)]
 pub struct PrioritizedDist(Box<PrioritizedDistInner>);
-
-/// Variant metadata for a package version on an index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RegistryVariantsJson {
-    pub(crate) filename: VariantsJsonFilename,
-    pub(crate) file: File,
-    pub(crate) index: IndexUrl,
-}
 
 /// The contents of a [`PrioritizedDist`], boxed to keep the outer type small.
 #[derive(Debug, Clone)]
@@ -417,6 +409,27 @@ impl PrioritizedDist {
 
     pub(crate) fn variants_json(&self) -> &[RegistryVariantsJson] {
         &self.0.variants_json
+    }
+
+    /// Return the metadata describing eligible variant wheels from this index.
+    pub(crate) fn variants_json_for_index(
+        &self,
+        index: &IndexUrl,
+    ) -> Option<&RegistryVariantsJson> {
+        self.0
+            .variants_json
+            .iter()
+            .find(|metadata| &metadata.index == index)
+            .filter(|_| {
+                self.0.wheels.iter().any(|(wheel, compatibility)| {
+                    &wheel.index == index
+                        && wheel.filename.variant().is_some()
+                        && matches!(
+                            compatibility,
+                            WheelCompatibility::Compatible(..) | WheelCompatibility::Variant(..)
+                        )
+                })
+            })
     }
 
     /// Return the `variants.json` files we need to check the candidate wheels.
@@ -811,14 +824,16 @@ impl<'a> CompatibleDist<'a> {
 }
 
 impl WheelCompatibility {
-    /// Record platform compatibility, deferring the property check for a variant wheel.
+    /// Record platform compatibility, deferring variant properties for a concrete target.
+    ///
+    /// Universal resolution has no tag priority and includes variants for every target.
     pub(crate) fn from_tag_priority(
         filename: &WheelFilename,
         hash: HashComparison,
         priority: Option<TagPriority>,
     ) -> Self {
         let build_tag = filename.build_tag().cloned();
-        if filename.variant().is_some() {
+        if filename.variant().is_some() && priority.is_some() {
             Self::Variant(hash, priority, build_tag)
         } else {
             Self::Compatible(hash, priority, build_tag)

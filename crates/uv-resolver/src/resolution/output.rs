@@ -243,7 +243,7 @@ fn add_version(
         hasher,
         in_memory,
     );
-    let (version, dist, metadata) = selected.into_parts();
+    let (version, dist, metadata, variants_json) = selected.into_parts();
 
     // Track yanks for registry distributions.
     match dist.yanked() {
@@ -291,6 +291,7 @@ fn add_version(
         kind: kind.clone(),
         hashes,
         metadata,
+        variants_json,
         role: package_role,
         marker: UniversalMarker::TRUE,
     }))
