@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
+pub use uv_pep508::{VariantFeature, VariantNamespace, VariantValue};
 
 // TODO(konsti): Standardize on a single schema URL once the variant metadata format is finalized.
 /// The PEP 825 draft schema for variant metadata without providers.
@@ -65,7 +66,7 @@ impl fmt::Display for UnsupportedVariantProperties {
                     if index > 0 {
                         f.write_str(" or ")?;
                     }
-                    write!(f, "`{namespace} :: {} :: {}`", feature.0, value.0)?;
+                    write!(f, "`{namespace} :: {feature} :: {value}`")?;
                 }
                 f.write_str(close)?;
             }
@@ -364,12 +365,6 @@ struct VariantsJsonWire {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VariantMetadataError {
-    #[error("Invalid variant namespace: `{0}`")]
-    InvalidNamespace(String),
-    #[error("Invalid variant feature: `{0}`")]
-    InvalidFeature(String),
-    #[error("Invalid variant value: `{0}`")]
-    InvalidValue(String),
     #[error("Variant namespace priorities must be non-empty and unique")]
     NamespacePriorities,
     #[error("Variant namespace `{0}` is missing from default-priorities.namespace")]
@@ -424,13 +419,10 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
                 .collect::<BTreeSet<_>>();
             if provider_namespaces != namespace_set {
                 return Err(VariantMetadataError::ProviderNamespaces {
-                    expected: namespaces
-                        .iter()
-                        .map(|namespace| namespace.0.clone())
-                        .collect(),
+                    expected: namespaces.iter().map(ToString::to_string).collect(),
                     actual: provider_namespaces
                         .into_iter()
-                        .map(|namespace| namespace.0.clone())
+                        .map(ToString::to_string)
                         .collect(),
                 });
             }
@@ -450,21 +442,15 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
                             || !order.iter().sorted().eq(static_properties.keys()) =>
                     {
                         return Err(VariantMetadataError::InvalidFeatureOrder {
-                            namespace: namespace.0.clone(),
-                            expected: static_properties
-                                .keys()
-                                .map(|feature| feature.0.clone())
-                                .collect(),
-                            actual: order.iter().map(|feature| feature.0.clone()).collect(),
+                            namespace: namespace.to_string(),
+                            expected: static_properties.keys().map(ToString::to_string).collect(),
+                            actual: order.iter().map(ToString::to_string).collect(),
                         });
                     }
                     None if static_properties.len() > 1 => {
                         return Err(VariantMetadataError::MissingFeatureOrder {
-                            namespace: namespace.0.clone(),
-                            features: static_properties
-                                .keys()
-                                .map(|feature| feature.0.clone())
-                                .collect(),
+                            namespace: namespace.to_string(),
+                            features: static_properties.keys().map(ToString::to_string).collect(),
                         });
                     }
                     Some(_) | None => {}
@@ -472,9 +458,9 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
                 for (feature, values) in static_properties {
                     if !values.iter().all_unique() {
                         return Err(VariantMetadataError::DuplicateValues(
-                            namespace.0.clone(),
-                            feature.0.clone(),
-                            values.iter().map(|value| value.0.clone()).collect(),
+                            namespace.to_string(),
+                            feature.to_string(),
+                            values.iter().map(ToString::to_string).collect(),
                         ));
                     }
                 }
@@ -484,20 +470,22 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
         for (label, properties) in &mut wire.variants {
             for (namespace, features) in properties.iter_mut() {
                 if !features.is_empty() && !namespace_set.contains(namespace) {
-                    return Err(VariantMetadataError::MissingNamespace(namespace.0.clone()));
+                    return Err(VariantMetadataError::MissingNamespace(
+                        namespace.to_string(),
+                    ));
                 }
                 for (feature, values) in features {
                     if values.is_empty() {
                         return Err(VariantMetadataError::EmptyValues(
-                            namespace.0.clone(),
-                            feature.0.clone(),
+                            namespace.to_string(),
+                            feature.to_string(),
                         ));
                     }
                     if !values.iter().all_unique() {
                         return Err(VariantMetadataError::DuplicateValues(
-                            namespace.0.clone(),
-                            feature.0.clone(),
-                            values.iter().map(|value| value.0.clone()).collect(),
+                            namespace.to_string(),
+                            feature.to_string(),
+                            values.iter().map(ToString::to_string).collect(),
                         ));
                     }
                     if label.as_str() == "null" {
@@ -528,78 +516,4 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
 struct VariantsJsonSchema {
     #[serde(rename = "$schema")]
     schema: String,
-}
-
-/// A validated variant namespace.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String")]
-pub struct VariantNamespace(String);
-
-impl VariantNamespace {
-    /// Return the namespace as a string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for VariantNamespace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl TryFrom<String> for VariantNamespace {
-    type Error = VariantMetadataError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if valid_component(&value, false) {
-            Ok(Self(value))
-        } else {
-            Err(VariantMetadataError::InvalidNamespace(value))
-        }
-    }
-}
-
-/// A validated variant feature.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String")]
-pub struct VariantFeature(String);
-
-impl TryFrom<String> for VariantFeature {
-    type Error = VariantMetadataError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if valid_component(&value, false) {
-            Ok(Self(value))
-        } else {
-            Err(VariantMetadataError::InvalidFeature(value))
-        }
-    }
-}
-
-/// A validated variant value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String")]
-pub struct VariantValue(String);
-
-impl TryFrom<String> for VariantValue {
-    type Error = VariantMetadataError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if valid_component(&value, true) {
-            Ok(Self(value))
-        } else {
-            Err(VariantMetadataError::InvalidValue(value))
-        }
-    }
-}
-
-fn valid_component(value: &str, allow_period: bool) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || character == b'_'
-                || (allow_period && character == b'.')
-        })
 }
