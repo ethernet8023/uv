@@ -482,11 +482,12 @@ impl VariantsJsonContent {
                 let (_, supported_values) = supported_features
                     .iter()
                     .find(|(supported_feature, _)| supported_feature == feature)?;
-                let selected_values = values
+                let mut selected_values = values
                     .iter()
                     .filter(|value| supported_values.contains(value))
                     .cloned()
-                    .collect();
+                    .collect::<Vec<_>>();
+                selected_values.sort_unstable();
                 selected_features.insert(feature.clone(), selected_values);
             }
             properties.insert(namespace.clone(), selected_features);
