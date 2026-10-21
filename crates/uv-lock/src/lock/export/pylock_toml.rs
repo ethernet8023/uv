@@ -534,6 +534,12 @@ struct PylockTomlWheel {
     hashes: Hashes,
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum WheelVariantPriority {
+    NonVariant,
+    Variant(VariantScore),
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct PylockTomlAttestationIdentity {
@@ -663,12 +669,22 @@ impl<'lock> PylockToml {
                     return Err(PylockTomlErrorKind::GitArchiveUnsupported(package.name));
                 }
                 Dist::Built(BuiltDist::Registry(dist)) => {
+                    let best_wheel = dist.best_wheel();
+                    if best_wheel.filename.variant().is_some()
+                        && package
+                            .variants_json_source
+                            .as_ref()
+                            .is_none_or(|source| source.index != best_wheel.index)
+                    {
+                        return Err(PylockTomlErrorKind::MissingVariantMetadata(package.name));
+                    }
                     package.wheels = Self::filter_and_convert_wheels(
                         resolution,
                         tags,
                         &requires_python,
                         node_index,
                         &dist.wheels,
+                        package.variants_json_source.as_ref(),
                         build_options.no_binary_package(dist.name()),
                     )?;
 
@@ -768,6 +784,7 @@ impl<'lock> PylockToml {
                         &requires_python,
                         node_index,
                         &dist.wheels,
+                        package.variants_json_source.as_ref(),
                         build_options.no_binary_package(&dist.name),
                     )?;
 
@@ -821,8 +838,7 @@ impl<'lock> PylockToml {
         })
     }
 
-    /// Filter wheels based on build options (--no-binary) and incompatible tags and return the
-    /// rest.
+    /// Filter wheels by build options, tag compatibility, and variant metadata source.
     ///
     /// Returns `Ok(None)` if no wheels are compatible.
     fn filter_and_convert_wheels(
@@ -831,23 +847,26 @@ impl<'lock> PylockToml {
         requires_python: &RequiresPython,
         node_index: NodeIndex,
         wheels: &[RegistryBuiltWheel],
+        variants_json_source: Option<&RegistryVariantsJson>,
         no_binary: bool,
     ) -> Result<Option<Vec<PylockTomlWheel>>, PylockTomlErrorKind> {
         if no_binary {
             return Ok(None);
         }
 
-        // Filter wheels based on tag compatibility and requires-python.
+        // Variant metadata describes only artifacts from its own index.
         let wheels: Vec<_> = wheels
             .iter()
             .filter(|wheel| {
-                !is_wheel_unreachable(
-                    &wheel.filename,
-                    resolution,
-                    requires_python,
-                    node_index,
-                    tags,
-                )
+                (wheel.filename.variant().is_none()
+                    || variants_json_source.is_some_and(|source| source.index == wheel.index))
+                    && !is_wheel_unreachable(
+                        &wheel.filename,
+                        resolution,
+                        requires_python,
+                        node_index,
+                        tags,
+                    )
             })
             .collect();
 
@@ -1680,7 +1699,7 @@ impl<'lock> PylockToml {
                 if let Some(filename) = &archive_wheel {
                     !no_binary
                         && (filename.variant().is_none()
-                            || (filename.compatibility(tags).is_compatible()
+                            || (filename.tag_compatibility(tags).is_compatible()
                                 && package.variant_priority(filename, &supported).is_some()))
                 } else {
                     !no_build
@@ -1749,7 +1768,7 @@ impl PylockTomlPackage {
         let mut has_eligible_variant = false;
         for wheel in self.wheels.iter().flatten() {
             let filename = wheel.filename(&self.name)?;
-            if filename.variant().is_some() && filename.compatibility(tags).is_compatible() {
+            if filename.variant().is_some() && filename.tag_compatibility(tags).is_compatible() {
                 wheel.to_registry_wheel(
                     install_path,
                     &self.name,
@@ -1761,7 +1780,7 @@ impl PylockTomlPackage {
         }
         if let Some(archive) = &self.archive
             && archive.wheel_filename(&self.name)?.is_some_and(|filename| {
-                filename.variant().is_some() && filename.compatibility(tags).is_compatible()
+                filename.variant().is_some() && filename.tag_compatibility(tags).is_compatible()
             })
         {
             archive.to_dist(install_path, &self.name, self.version.as_ref())?;
@@ -1934,14 +1953,15 @@ impl PylockTomlPackage {
         tags: &Tags,
         supported: &SupportedVariantProperties,
     ) -> Option<&PylockTomlWheel> {
-        type WheelPriority = (Option<VariantScore>, TagPriority, Option<BuildTag>);
+        type WheelPriority = (WheelVariantPriority, TagPriority, Option<BuildTag>);
 
         let mut best: Option<(WheelPriority, &PylockTomlWheel)> = None;
         for wheel in self.wheels.iter().flatten() {
             let Ok(filename) = wheel.filename(&self.name) else {
                 continue;
             };
-            let TagCompatibility::Compatible(tag_priority) = filename.compatibility(tags) else {
+            let TagCompatibility::Compatible(tag_priority) = filename.tag_compatibility(tags)
+            else {
                 continue;
             };
             let Some(variant_priority) = self.variant_priority(&filename, supported) else {
@@ -1969,14 +1989,14 @@ impl PylockTomlPackage {
         &self,
         filename: &WheelFilename,
         supported: &SupportedVariantProperties,
-    ) -> Option<Option<VariantScore>> {
+    ) -> Option<WheelVariantPriority> {
         match filename.variant() {
             Some(label) => self
                 .variants_json
                 .as_ref()?
                 .score_variant(label, supported)
-                .map(Some),
-            None => Some(None),
+                .map(WheelVariantPriority::Variant),
+            None => Some(WheelVariantPriority::NonVariant),
         }
     }
 
