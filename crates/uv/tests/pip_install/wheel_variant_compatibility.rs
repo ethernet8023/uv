@@ -650,6 +650,66 @@ fn select_variant_by_static_provider_order() -> Result<()> {
     Ok(())
 }
 
+/// Inspection evaluates dependencies using the supported subset of a wheel's property alternatives.
+#[test]
+fn installed_variant_properties_match_selection() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let scenario = toml::from_str::<Scenario>(indoc! {r#"
+        name = "installed-variant-properties"
+        root = {}
+        expected.satisfiable = true
+
+        [packages.ok.versions."1.0.0"]
+        wheel = false
+        sdist = false
+
+        [packages.ok.versions."1.0.0".variants]
+        namespaces = ["blas_lapack"]
+
+        [packages.ok.versions."1.0.0".variants.providers.blas_lapack]
+        static-properties.library = ["openblas"]
+
+        [packages.ok.versions."1.0.0".variants.wheels.blas]
+        properties = [
+            "blas_lapack :: library :: openblas",
+            "blas_lapack :: library :: accelerate",
+        ]
+        requires = ["missing; 'blas_lapack :: library :: accelerate' in variant_properties"]
+    "#})?;
+    let server = PackseServer::from_scenario(&scenario);
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("ok==1.0.0"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + ok==1.0.0
+    ");
+
+    let recorded = context.read(
+        context
+            .site_packages()
+            .join("ok-1.0.0.dist-info/uv_variant.json"),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded)?,
+        json!({"label": "blas", "properties": {"blas_lapack": {"library": ["openblas"]}}}),
+    );
+    uv_snapshot!(context.pip_check(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Checked 1 package in [TIME]
+    All installed packages are compatible
+    ");
+    Ok(())
+}
+
 /// Fall back to an older release and reject its otherwise preferred incompatible NVIDIA variant.
 #[test]
 fn backtrack_to_compatible_nvidia_variant() -> Result<()> {

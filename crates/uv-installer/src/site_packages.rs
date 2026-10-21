@@ -300,9 +300,19 @@ impl SitePackages {
                     }
                 }
 
+                let variants = distribution.read_variant_context_for_markers(
+                    metadata
+                        .requires_dist
+                        .iter()
+                        .map(|dependency| &dependency.marker),
+                )?;
+
                 // Verify that the dependencies are installed.
                 for dependency in &metadata.requires_dist {
-                    if !dependency.evaluate_markers(markers, &[]) {
+                    if !dependency
+                        .marker
+                        .evaluate_with_variants(markers, &variants, &[])
+                    {
                         continue;
                     }
 
@@ -606,11 +616,21 @@ impl SitePackages {
                         .cloned()
                         .map(Requirement::from)
                         .collect::<Vec<_>>();
+                    // Cache the lookup separately from its optional result so non-variant
+                    // wheels are also checked only once.
+                    let mut variants = None;
                     for dependency in modifiers.apply(
                         DependencyModifierScope::Package(name, distribution.version()),
                         &dependencies,
                     ) {
-                        if dependency.evaluate_markers(Some(markers), &requirement.extras) {
+                        if variants.is_none() && dependency.marker.has_variant_expression() {
+                            variants = Some(distribution.read_variant_context()?);
+                        }
+                        if dependency.marker.evaluate_with_variants(
+                            markers,
+                            &variants,
+                            &requirement.extras,
+                        ) {
                             let dependency = dependency.into_owned();
                             if seen.insert(dependency.clone()) {
                                 stack.push(dependency);
