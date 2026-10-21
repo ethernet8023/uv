@@ -119,6 +119,22 @@ fn parse_static_provider() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn reject_duplicate_provider_namespaces() {
+    let metadata = r#"{
+        "$schema": "https://variants-schema.wheelnext.dev/peps/850/v0.2.0.json",
+        "default-priorities": {"namespace": ["cpu"]},
+        "providers": {
+            "cpu": {"static-properties": {"level": ["v3"]}},
+            "cpu": {"requires": ["other-provider"]}
+        },
+        "variants": {"null": {}}
+    }"#;
+    let error = VariantsJsonContent::from_slice(metadata.as_bytes())
+        .expect_err("duplicate provider namespaces must be rejected");
+    assert_snapshot!(error, @"duplicate key in variant metadata at line 7 column 9");
+}
+
+#[test]
 fn reject_missing_providers() {
     let invalid = json!({
         "$schema": PEP_850_SCHEMA,

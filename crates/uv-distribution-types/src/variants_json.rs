@@ -1,9 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::marker::PhantomData;
 
 use itertools::{Either, Itertools};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
@@ -161,6 +163,16 @@ impl VariantsJsonContent {
     /// The label when this metadata describes exactly one wheel variant.
     pub fn wheel_label(&self) -> Option<&VariantLabel> {
         self.variants.keys().exactly_one().ok()
+    }
+
+    /// Return the schema URL declared by the metadata.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// Return whether the metadata describes the given variant label.
+    pub fn contains_variant(&self, label: &VariantLabel) -> bool {
+        self.variants.contains_key(label)
     }
 
     /// The variant label, if this describes a single compatible wheel variant.
@@ -433,6 +445,7 @@ pub struct VariantProvider {
 #[serde(untagged, rename_all_fields = "kebab-case", deny_unknown_fields)]
 enum ProviderKind {
     Static {
+        #[serde(deserialize_with = "deserialize_unique_map")]
         static_properties: BTreeMap<VariantFeature, Vec<VariantValue>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         feature_order: Option<Vec<VariantFeature>>,
@@ -453,8 +466,57 @@ struct VariantsJsonWire {
     #[serde(rename = "$schema")]
     schema: String,
     default_priorities: DefaultPriorities,
-    providers: Option<BTreeMap<VariantNamespace, VariantProvider>>,
-    variants: BTreeMap<VariantLabel, VariantProperties>,
+    providers: Option<UniqueMap<VariantNamespace, VariantProvider>>,
+    variants: UniqueMap<
+        VariantLabel,
+        UniqueMap<VariantNamespace, UniqueMap<VariantFeature, Vec<VariantValue>>>,
+    >,
+}
+
+/// A metadata map must not silently replace an earlier value for the same key.
+#[derive(Deserialize)]
+#[serde(
+    transparent,
+    bound(deserialize = "K: Ord + Deserialize<'de>, V: Deserialize<'de>")
+)]
+struct UniqueMap<K, V>(#[serde(deserialize_with = "deserialize_unique_map")] BTreeMap<K, V>);
+
+fn deserialize_unique_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    struct UniqueMapVisitor<K, V>(PhantomData<(K, V)>);
+
+    impl<'de, K, V> Visitor<'de> for UniqueMapVisitor<K, V>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry()? {
+                if values.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate key in variant metadata",
+                    ));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -496,8 +558,26 @@ pub enum VariantMetadataError {
 impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
     type Error = VariantMetadataError;
 
-    fn try_from(mut wire: VariantsJsonWire) -> Result<Self, Self::Error> {
-        let namespaces = &wire.default_priorities.namespace;
+    fn try_from(wire: VariantsJsonWire) -> Result<Self, Self::Error> {
+        let mut metadata = Self {
+            schema: wire.schema,
+            default_priorities: wire.default_priorities,
+            providers: wire.providers.map(|providers| providers.0),
+            variants: wire
+                .variants
+                .0
+                .into_iter()
+                .map(|(label, namespaces)| {
+                    let properties = namespaces
+                        .0
+                        .into_iter()
+                        .map(|(namespace, features)| (namespace, features.0))
+                        .collect();
+                    (label, properties)
+                })
+                .collect(),
+        };
+        let namespaces = &metadata.default_priorities.namespace;
         let namespace_set: BTreeSet<_> = namespaces.iter().collect();
         if namespaces.is_empty() || namespace_set.len() != namespaces.len() {
             return Err(VariantMetadataError::NamespacePriorities);
@@ -505,8 +585,8 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
 
         // The provider checks below validate metadata only. Supported properties are collected
         // separately and passed to `score_variant` to determine compatibility.
-        if wire.providers.is_some() || wire.schema == PEP_850_SCHEMA {
-            let provider_namespaces = wire
+        if metadata.providers.is_some() || metadata.schema == PEP_850_SCHEMA {
+            let provider_namespaces = metadata
                 .providers
                 .iter()
                 .flat_map(|providers| providers.keys())
@@ -521,7 +601,7 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
                 });
             }
         }
-        if let Some(providers) = &wire.providers {
+        if let Some(providers) = &metadata.providers {
             for (namespace, provider) in providers {
                 let ProviderKind::Static {
                     static_properties,
@@ -561,7 +641,7 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
             }
         }
 
-        for (label, properties) in &mut wire.variants {
+        for (label, properties) in &mut metadata.variants {
             for (namespace, features) in properties.iter_mut() {
                 if !features.is_empty() && !namespace_set.contains(namespace) {
                     return Err(VariantMetadataError::MissingNamespace(
@@ -592,16 +672,11 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
 
         // Parse leniently for forward compatibility: accept unknown schema versions when their
         // contents pass validation.
-        if !matches!(wire.schema.as_str(), PEP_825_SCHEMA | PEP_850_SCHEMA) {
-            debug!("Unknown variant metadata schema `{}`", wire.schema);
+        if !matches!(metadata.schema.as_str(), PEP_825_SCHEMA | PEP_850_SCHEMA) {
+            debug!("Unknown variant metadata schema `{}`", metadata.schema);
         }
 
-        Ok(Self {
-            schema: wire.schema,
-            default_priorities: wire.default_priorities,
-            providers: wire.providers,
-            variants: wire.variants,
-        })
+        Ok(metadata)
     }
 }
 
