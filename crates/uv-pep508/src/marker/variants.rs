@@ -51,7 +51,7 @@ impl FromStr for VariantNamespace {
     type Err = VariantParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_from(value.trim().to_owned())
+        Self::try_from(value.to_owned())
     }
 }
 
@@ -89,7 +89,7 @@ impl FromStr for VariantFeature {
     type Err = VariantParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_from(value.trim().to_owned())
+        Self::try_from(value.to_owned())
     }
 }
 
@@ -127,7 +127,7 @@ impl FromStr for VariantValue {
     type Err = VariantParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_from(value.trim().to_owned())
+        Self::try_from(value.to_owned())
     }
 }
 

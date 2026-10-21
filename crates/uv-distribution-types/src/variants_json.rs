@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
+use uv_pep508::MarkerVariantsEnvironment;
 pub use uv_pep508::{VariantFeature, VariantNamespace, VariantValue};
 
 // TODO(konsti): Standardize on a single schema URL once the variant metadata format is finalized.
@@ -47,6 +48,34 @@ pub type VariantProperties =
 pub struct SelectedVariant {
     pub label: VariantLabel,
     pub properties: VariantProperties,
+}
+
+impl MarkerVariantsEnvironment for SelectedVariant {
+    fn contains_namespace(&self, namespace: &VariantNamespace) -> bool {
+        self.properties.contains_key(namespace)
+    }
+
+    fn contains_feature(&self, namespace: &VariantNamespace, feature: &VariantFeature) -> bool {
+        self.properties
+            .get(namespace)
+            .is_some_and(|features| features.contains_key(feature))
+    }
+
+    fn contains_property(
+        &self,
+        namespace: &VariantNamespace,
+        feature: &VariantFeature,
+        value: &VariantValue,
+    ) -> bool {
+        self.properties
+            .get(namespace)
+            .and_then(|features| features.get(feature))
+            .is_some_and(|values| values.contains(value))
+    }
+
+    fn label(&self) -> Option<&str> {
+        Some(self.label.as_str())
+    }
 }
 
 /// Required variant properties unsupported by the target system.
