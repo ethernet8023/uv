@@ -749,18 +749,24 @@ fn incompatible_installed_variant_without_replacement() -> Result<()> {
     Ok(())
 }
 
-/// A variant-only release cannot be represented as an installable package in `pylock.toml`.
+/// The exported lockfile carries the variant metadata needed to install without the sidecar.
 #[test]
-fn pylock_rejects_selected_wheel_variant() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
+fn pylock_selects_wheel_variant() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filter((r"[a-f0-9]{64}", "[HASH]"));
     let links = context.temp_dir.child("links");
     links.create_dir_all()?;
-    let variant = null_variant().to_string();
+    let variant = json!({
+        "$schema": PEP_850_SCHEMA,
+        "default-priorities": { "namespace": ["blas"] },
+        "providers": { "blas": { "static-properties": { "library": ["openblas"] } } },
+        "variants": { "openblas": { "blas": { "library": ["openblas"] } } },
+    })
+    .to_string();
     let (_, wheel) = WheelBuilder::new(&"ok".parse()?, &"1.0.0".parse()?)
         .files(&[("ok-1.0.0.dist-info/variant.json", &variant)])
         .build();
     links
-        .child("ok-1.0.0-py3-none-any-null.whl")
+        .child("ok-1.0.0-py3-none-any-openblas.whl")
         .write_binary(&wheel)?;
     links.child("ok-1.0.0-variants.json").write_str(&variant)?;
     context
@@ -777,16 +783,50 @@ fn pylock_rejects_selected_wheel_variant() -> Result<()> {
         .arg("wheel-variants")
         .arg("--no-header")
         .arg("-o")
-        .arg("pylock.toml"), @"
-    exit_code: 2 (failure)
-    ----- stderr -----
-    Resolved 1 package in [TIME]
-    error: Package `ok` resolved to a wheel variant, which pylock.toml export does not support
-    ");
+        .arg("pylock.toml"), @"");
+    links.child("ok-1.0.0-variants.json").write_str("{}")?;
+    uv_snapshot!(context.filters(), context.pip_sync()
+        .arg("--preview-features")
+        .arg("pylock,wheel-variants")
+        .arg("pylock.toml"), @"");
+    Ok(())
+}
+
+/// A frozen export must authenticate the direct wheel before reading its embedded metadata.
+#[test]
+fn pylock_rejects_changed_locked_variant_wheel() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filter((r"[a-f0-9]{64}", "[HASH]"));
+    let variant = null_variant().to_string();
+    let (_, wheel) = WheelBuilder::new(&"ok".parse()?, &"1.0.0".parse()?)
+        .files(&[("ok-1.0.0.dist-info/variant.json", &variant)])
+        .build();
+    let wheel_path = context.temp_dir.child("ok-1.0.0-py3-none-any-null.whl");
+    wheel_path.write_binary(&wheel)?;
     context
         .temp_dir
-        .child("pylock.toml")
-        .assert(predicates::path::missing());
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["ok"]
+
+        [tool.uv.sources]
+        ok = { path = "ok-1.0.0-py3-none-any-null.whl" }
+    "#})?;
+    uv_snapshot!(context.filters(), context.lock()
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("--no-index"), @"");
+
+    wheel_path.write_binary(&vec![0; wheel.len()])?;
+    uv_snapshot!(context.filters(), context.export()
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("--frozen")
+        .arg("--format")
+        .arg("pylock.toml"), @"");
     Ok(())
 }
 

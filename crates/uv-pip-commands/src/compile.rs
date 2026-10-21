@@ -781,6 +781,9 @@ pub async fn pip_compile(
             export
                 .generate_missing_hashes(&client, concurrency.downloads, install_path)
                 .await?;
+            export
+                .resolve_variant_metadata(&client, &cache, install_path)
+                .await?;
 
             write!(writer, "{}", export.to_toml()?)?;
         }
